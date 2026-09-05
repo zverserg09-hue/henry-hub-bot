@@ -95,10 +95,7 @@ def fetch_prices():
         except Exception as e:
             logger.warning(f"Yahoo не сработал (попытка {attempt + 1}): {e}")
 
- 
-        except Exception as e:
-            logger.warning(f"Yahoo не сработал (попытка {attempt + 1}): {e}")
-
+      
     # --- Источник 3: синтетические данные (чтобы бот всегда работал) ---
     logger.warning("Все источники недоступны — используем синтетические данные")
     np.random.seed(42)
