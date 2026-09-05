@@ -26,14 +26,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: DEBUG: Check EIA Key presence
-        run: |
-          if [ -n "\$EIA_API_KEY" ]; then
-            echo "✅ EIA_API_KEY FOUND (value hidden by GitHub)"
-          else
-            echo "❌ ERROR: EIA_API_KEY is EMPTY"
-          fi
-
       - name: Run signal script
         run: python henry_hub_signals.py
 
