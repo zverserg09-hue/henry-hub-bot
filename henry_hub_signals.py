@@ -446,6 +446,36 @@ def main():
     send_telegram(report)
     logger.info("=== END HENRY HUB SIGNALS ===")
 
+# ВСТАВЬ ЭТО В КОНЕЦ ФАЙЛА, ПЕРЕД if __name__ == "__main__":
+import os
+import requests
+
+def test_telegram():
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    
+    if not token or not chat_id:
+        print("❌ ОШИБКА: Не найдены переменные TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID!")
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": "✅ Проверка: GitHub Actions может писать в Telegram!",
+        "parse_mode": "Markdown"
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        data = resp.json()
+        if data.get("ok"):
+            print("✅ ТЕСТ УСПЕШЕН: Сообщение отправлено!")
+        else:
+            print(f"❌ ТЕСТ НЕ ПРОЙДЕН: {data}")
+    except Exception as e:
+        print(f"❌ ТЕСТ НЕ ПРОЙДЕН (ошибка сети): {e}")
+
+# Запускаем тест сразу при старте
+test_telegram()
 
 if __name__ == "__main__":
     main()
