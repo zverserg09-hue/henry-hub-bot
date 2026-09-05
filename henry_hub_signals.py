@@ -92,26 +92,7 @@ def fetch_prices():
             df.set_index("Date", inplace=True)
             logger.info(f"Yahoo: получено {len(df)} баров")
             return df
-        except Exception as e:
-            logger.warning(f"Yahoo не сработал (попытка {attempt + 1}): {e}")
-
-      
-    # --- Источник 3: синтетические данные (чтобы бот всегда работал) ---
-    logger.warning("Все источники недоступны — используем синтетические данные")
-    np.random.seed(42)
-    dates = pd.date_range(end=datetime.now(), periods=200, freq='D')
-    close = 2.8 + np.cumsum(np.random.normal(0.001, 0.08, 200))
-    close = np.maximum(close, 1.5)  # не уходим ниже $1.50
-    open_ = close * (1 + np.random.uniform(-0.02, 0.02, 200))
-    high = np.maximum(close, open_) * (1 + np.random.uniform(0, 0.03, 200))
-    low = np.minimum(close, open_) * (1 - np.random.uniform(0, 0.03, 200))
-    volume = np.random.randint(10000, 50000, 200).astype(float)
-    df = pd.DataFrame({
-        "Date": dates, "Open": open_, "High": high,
-        "Low": low, "Close": close, "Volume": volume,
-    })
-    df.set_index("Date", inplace=True)
-    return df
+        
 
 
     except Exception as e:
