@@ -4,15 +4,14 @@ on:
   push:
     branches: ["main"]
   schedule:
-    - cron: "0 9 * * *"  # каждый день в 09:00 UTC
-  workflow_dispatch:    # чтобы можно было запустить вручную для теста
+    - cron: "0 9 * * *"
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     env:
-      # ВАЖНО: только латинские буквы, никаких греческих символов
       EIA_API_KEY: \${{ secrets.EIA_API_KEY }}
 
     steps:
@@ -27,7 +26,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ВРЕМЕННЫЙ ШАГ ДЛЯ ОТЛАДКИ: проверка, виден ли ключ
       - name: DEBUG: Check EIA Key presence
         run: |
           if [ -n "\$EIA_API_KEY" ]; then
