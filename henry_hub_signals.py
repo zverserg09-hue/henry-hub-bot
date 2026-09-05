@@ -1,18 +1,15 @@
 name: Henry Hub Signals
 
 on:
-  push:
-    branches: ["main"]
   schedule:
-    - cron: "0 9 * * *"
+    # Запуск каждый день в 08:00, 12:00, 16:00, 20:00 UTC
+    - cron: "0 8,12,16,20 * * *"
+  # Можно запустить вручную кнопкой "Run workflow" в интерфейсе GitHub
   workflow_dispatch:
 
 jobs:
-  build:
+  run-script:
     runs-on: ubuntu-latest
-
-    env:
-      EIA_API_KEY: \${{ secrets.EIA_API_KEY }}
 
     steps:
       - name: Checkout repository
@@ -26,6 +23,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run signal script
+      - name: Run the signal script
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+          STORAGE_CURRENT_BCF: "3153"
+          LAST_STORAGE_BUILD: "15"
+          STORAGE_FORECAST: "19"
         run: python henry_hub_signals.py
-
