@@ -113,7 +113,7 @@ def fetch_prices():
     return df
 
 
-        except Exception as e:
+    except Exception as e:
             logger.warning(f"Yahoo не сработал (попытка {attempt + 1}): {e}")
 
     # --- Источник 3: синтетические данные (чтобы бот всегда работал) ---
