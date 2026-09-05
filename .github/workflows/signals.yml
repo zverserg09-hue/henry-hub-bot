@@ -2,16 +2,17 @@ name: Henry Hub Signals
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   schedule:
     - cron: "0 9 * * *"  # каждый день в 09:00 UTC
+  workflow_dispatch:    # чтобы можно было запустить вручную для теста
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     env:
-      # ВАЖНО: имя переменной и секрет должны быть строго на латинице
+      # ВАЖНО: только латинские буквы, никаких греческих символов
       EIA_API_KEY: \${{ secrets.EIA_API_KEY }}
 
     steps:
