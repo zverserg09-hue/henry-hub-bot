@@ -32,61 +32,123 @@ LAST_SIGNAL_FILE = "last_signal.json"
 REQUEST_TIMEOUT_SECONDS = 10
 
 logging.basicConfig(
-    filename=LOG_FILE,
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE),
+    ],
 )
 logger = logging.getLogger(__name__)
+
 # ============================================================
 # МОДУЛЬ 1: ЦЕНОВЫЕ ДАННЫЕ (с защитой от зависания)
 # ============================================================
 
-def fetch_prices():
-    logger.info("Начинаем загрузку цен для NG=F")
-    try:
-        url = (
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{SYMBOL}"
-            f"?period1={int(time.time()) - 365*86400*2}"
-            f"&period2={int(time.time())}"
-            f"&interval=1d"
-        )
-        r = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
-        r.raise_for_status()
-        data = r.json()
-        logger.info("Цены получены через основной эндпоинт")
+CACHE_FILE = "cache_prices_ng.csv"
 
-        timestamps = data["chart"]["result"][0]["timestamp"]
-        quotes = data["chart"]["result"][0]["indicators"]["quote"][0]
+def fetch_prices(symbol=SYMBOL, days=365*2, max_retries=3):
+    """
+    Загружает цены через JSON-эндпоинт Yahoo с обработкой 429 и кэшированием.
+    Возвращает DataFrame с индексом Date.
+    """
+    logger.info(f"Начинаем загрузку цен для {symbol}")
+
+    # 1. Проверяем кэш
+    if os.path.exists(CACHE_FILE):
+        file_age = time.time() - os.path.getmtime(CACHE_FILE)
+        if file_age < 24 * 3600:
+            try:
+                df = pd.read_csv(CACHE_FILE, index_col="Date", parse_dates=["Date"])
+                logger.info("Данные загружены из кэша (свежие).")
+                return df
+            except Exception as e:
+                logger.warning(f"Не удалось прочитать кэш: {e}. Запрашиваем заново.")
+
+    # 2. Запрос к Yahoo с повторами при 429
+    now = int(time.time())
+    period1 = now - days * 86400
+    period2 = now
+
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        f"?period1={period1}&period2={period2}&interval=1d"
+    )
+
+    r = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+
+            if r.status_code == 200:
+                logger.info("Цены получены через основной эндпоинт.")
+                break
+
+            if r.status_code == 429:
+                retry_after = r.headers.get('Retry-After')
+                delay = 60
+                if retry_after:
+                    try:
+                        delay = int(retry_after)
+                    except ValueError:
+                        delay = 60
+                logger.warning(f"429 от Yahoo. Ждём {delay} сек (попытка {attempt+1}/{max_retries})...")
+                time.sleep(delay)
+                continue
+
+            logger.error(f"Ошибка Yahoo API: статус {r.status_code}, ответ: {r.text[:200]}")
+            if attempt == max_retries - 1:
+                return pd.DataFrame()
+            time.sleep(5)
+
+        except Exception as e:
+            logger.error(f"Сетевая ошибка (попытка {attempt+1}): {e}")
+            if attempt == max_retries - 1:
+                return pd.DataFrame()
+            time.sleep(5)
+
+    # 3. Парсим JSON
+    try:
+        data = r.json()
+        chart = data.get("chart", {})
+        result = chart.get("result", [])
+
+        if not result:
+            logger.error("В ответе Yahoo нет данных (result пуст).")
+            return pd.DataFrame()
+
+        res = result[0]
+        timestamps = res.get("timestamp", [])
+        quotes = res.get("indicators", {}).get("quote", [{}])[0]
+
+        if len(timestamps) == 0:
+            logger.error("Нет временных меток в ответе Yahoo.")
+            return pd.DataFrame()
+
+        def safe_get(key):
+            arr = quotes.get(key, [])
+            return arr[:len(timestamps)]
 
         df = pd.DataFrame({
             "Date": [datetime.fromtimestamp(t) for t in timestamps],
-            "Open": quotes["open"],
-            "High": quotes["high"],
-            "Low": quotes["low"],
-            "Close": quotes["close"],
-            "Volume": quotes["volume"],
+            "Open": safe_get("open"),
+            "High": safe_get("high"),
+            "Low": safe_get("low"),
+            "Close": safe_get("close"),
+            "Volume": safe_get("volume"),
         })
         df.dropna(inplace=True)
         df.set_index("Date", inplace=True)
+
+        df.to_csv(CACHE_FILE, index=True)
+        logger.info("Данные получены от Yahoo и сохранены в кэш.")
         return df
 
     except Exception as e:
-        logger.warning(f"Основной эндпоинт не сработал: {e}. Пробуем fallback.")
-        try:
-            url = (
-                f"https://query1.finance.yahoo.com/v7/finance/download/{SYMBOL}"
-                f"?period1={int(time.time()) - 365*86400*2}"
-                f"&period2={int(time.time())}"
-                f"&interval=1d&events=history"
-            )
-            df = pd.read_csv(url)
-            df["Date"] = pd.to_datetime(df["Date"])
-            df.set_index("Date", inplace=True)
-            logger.info("Цены получены через fallback-эндпоинт")
-            return df
-        except Exception as e2:
-            logger.error(f"Оба источника цен недоступны: {e2}")
-            raise
+        logger.error(f"Ошибка парсинга JSON от Yahoo: {e}")
+        return pd.DataFrame()
+
+
 # ============================================================
 # МОДУЛЬ 2: ИНДИКАТОРЫ
 # ============================================================
@@ -269,7 +331,7 @@ def get_eia_storage():
         return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
 
     try:
-        url = f"http://api.eia.gov/series/?api_key={EIA_API_KEY}&series_id=NG.NW2_EPG0_SGO_RNG_RNGFM_WUS"
+        url = f"https://api.eia.gov/v2/seriesid/NG.NW2_EPG0_SGO_RNG_RNGFM_WUS?api_key={EIA_API_KEY}"
         r = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
         r.raise_for_status()
         data = r.json()
@@ -382,8 +444,8 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-def send_telegram(message):
-    """Отправляет сообщение в Telegram, если токен и chat_id заданы."""
+def send_telegram(message, max_retries=3):
+    """Отправляет сообщение в Telegram с обработкой 429."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.info("Telegram credentials missing. Skipping send.")
         return
@@ -395,40 +457,30 @@ def send_telegram(message):
         "parse_mode": "Markdown"
     }
 
-    max_retries = 3
     for attempt in range(max_retries):
         try:
             r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-            
-            # Если всё ок (статус 200 и ok=True)
+
             if r.status_code == 200:
-                data = r.json()
-                if data.get("ok"):
-                    logger.info("Telegram message sent successfully.")
-                    return True
-            
-            # Если ошибка 429 (Too Many Requests)
+                logger.info(f"Telegram message sent (status: {r.status_code})")
+                return
+
             if r.status_code == 429:
                 data = r.json()
-                # Получаем время ожидания от Telegram. Если его нет, ставим 60 сек по умолчанию
                 retry_after = data.get("parameters", {}).get("retry_after", 60)
-                logger.warning(f"Telegram API rate limit exceeded (429). Waiting {retry_after} seconds before retry...")
+                logger.warning(f"Telegram 429. Ждём {retry_after} сек (попытка {attempt+1}/{max_retries})...")
                 time.sleep(retry_after)
-                continue  # Перезапускаем цикл (следующая попытка)
-            
-            # Любые другие ошибки (400, 500 и т.д.)
-            logger.error(f"Telegram API error {r.status_code}: {r.text}")
-            return False
+                continue
+
+            logger.error(f"Telegram API error: статус {r.status_code}, ответ: {r.text[:200]}")
+            return
 
         except Exception as e:
-            logger.error(f"Failed to send Telegram message (attempt {attempt + 1}): {e}")
+            logger.error(f"Failed to send Telegram message (попытка {attempt+1}): {e}")
             if attempt == max_retries - 1:
-                return False
-            # Небольшая пауза при сетевых ошибках
+                return
             time.sleep(5)
 
-    logger.error("Max retries reached. Failed to send message.")
-    return False
 
 
 
@@ -439,11 +491,16 @@ def main():
     # 1. Цены
     try:
         df = fetch_prices()
+        if df.empty:
+            logger.critical("Не удалось загрузить цены (пустой DataFrame).")
+            send_telegram("❌ Henry Hub: ошибка загрузки цен\nYahoo вернул пустые данные или 429.")
+            return
         logger.info(f"Loaded {len(df)} price bars")
     except Exception as e:
         logger.critical(f"Cannot load prices: {e}")
         send_telegram(f"❌ Henry Hub: ошибка загрузки цен\n{e}")
         return
+
 
     # 2. Индикаторы
     ind = calc_indicators(df)
