@@ -376,6 +376,12 @@ def parse_news():
 
     return titles
 
+import time
+import logging
+import requests
+
+logger = logging.getLogger(__name__)
+
 def send_telegram(message):
     """Отправляет сообщение в Telegram, если токен и chat_id заданы."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -388,12 +394,43 @@ def send_telegram(message):
         "text": message,
         "parse_mode": "Markdown"
     }
-    try:
-        r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-        r.raise_for_status()
-        logger.info(f"Telegram message sent (status: {r.status_code})")
-    except Exception as e:
-        logger.error(f"Failed to send Telegram message: {e}")
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+            
+            # Если всё ок (статус 200 и ok=True)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("ok"):
+                    logger.info("Telegram message sent successfully.")
+                    return True
+            
+            # Если ошибка 429 (Too Many Requests)
+            if r.status_code == 429:
+                data = r.json()
+                # Получаем время ожидания от Telegram. Если его нет, ставим 60 сек по умолчанию
+                retry_after = data.get("parameters", {}).get("retry_after", 60)
+                logger.warning(f"Telegram API rate limit exceeded (429). Waiting {retry_after} seconds before retry...")
+                time.sleep(retry_after)
+                continue  # Перезапускаем цикл (следующая попытка)
+            
+            # Любые другие ошибки (400, 500 и т.д.)
+            logger.error(f"Telegram API error {r.status_code}: {r.text}")
+            return False
+
+        except Exception as e:
+            logger.error(f"Failed to send Telegram message (attempt {attempt + 1}): {e}")
+            if attempt == max_retries - 1:
+                return False
+            # Небольшая пауза при сетевых ошибках
+            time.sleep(5)
+
+    logger.error("Max retries reached. Failed to send message.")
+    return False
+
+
 
 
 def main():
