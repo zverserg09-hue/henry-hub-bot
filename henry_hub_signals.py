@@ -114,7 +114,7 @@ def fetch_prices():
     return df
 
 
-        except Exception as e:
+    except Exception as e:
             logger.warning(f"Источник 1 не сработал (попытка {attempt + 1}): {e}")
             time.sleep(delay)
 
