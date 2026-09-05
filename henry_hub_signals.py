@@ -42,51 +42,84 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 def fetch_prices():
-    logger.info("Начинаем загрузку цен для NG=F")
-    try:
-        url = (
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{SYMBOL}"
-            f"?period1={int(time.time()) - 365*86400*2}"
-            f"&period2={int(time.time())}"
-            f"&interval=1d"
-        )
-        r = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
-        r.raise_for_status()
-        data = r.json()
-        logger.info("Цены получены через основной эндпоинт")
+    """Загрузка цен NG=F с ретраями и User-Agent (защита от 429)."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
 
-        timestamps = data["chart"]["result"][0]["timestamp"]
-        quotes = data["chart"]["result"][0]["indicators"]["quote"][0]
+    # Три попытки с задержкой 3, 6, 9 секунд
+    for attempt in range(3):
+        delay = 3 * (attempt + 1)
+        logger.info(f"Попытка загрузки цен #{attempt + 1} (пауза {delay}с)")
 
-        df = pd.DataFrame({
-            "Date": [datetime.fromtimestamp(t) for t in timestamps],
-            "Open": quotes["open"],
-            "High": quotes["high"],
-            "Low": quotes["low"],
-            "Close": quotes["close"],
-            "Volume": quotes["volume"],
-        })
-        df.dropna(inplace=True)
-        df.set_index("Date", inplace=True)
-        return df
-
-    except Exception as e:
-        logger.warning(f"Основной эндпоинт не сработал: {e}. Пробуем fallback.")
+        # --- Источник 1: Yahoo Chart API ---
         try:
             url = (
-                f"https://query1.finance.yahoo.com/v7/finance/download/{SYMBOL}"
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{SYMBOL}"
                 f"?period1={int(time.time()) - 365*86400*2}"
                 f"&period2={int(time.time())}"
-                f"&interval=1d&events=history"
+                f"&interval=1d"
             )
-            df = pd.read_csv(url)
-            df["Date"] = pd.to_datetime(df["Date"])
+            r = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS, headers=headers)
+            if r.status_code == 429:
+                logger.warning(f"Yahoo 429 (попытка {attempt + 1})")
+                time.sleep(delay)
+                continue
+            r.raise_for_status()
+            data = r.json()
+
+            timestamps = data["chart"]["result"][0]["timestamp"]
+            quotes = data["chart"]["result"][0]["indicators"]["quote"][0]
+
+            df = pd.DataFrame({
+                "Date": [datetime.fromtimestamp(t) for t in timestamps],
+                "Open": quotes["open"],
+                "High": quotes["high"],
+                "Low": quotes["low"],
+                "Close": quotes["close"],
+                "Volume": quotes["volume"],
+            })
+            df.dropna(inplace=True)
             df.set_index("Date", inplace=True)
-            logger.info("Цены получены через fallback-эндпоинт")
+            logger.info(f"Цены получены через Yahoo Chart API ({len(df)} баров)")
             return df
-        except Exception as e2:
-            logger.error(f"Оба источника цен недоступны: {e2}")
-            raise
+        except Exception as e:
+            logger.warning(f"Источник 1 не сработал (попытка {attempt + 1}): {e}")
+            time.sleep(delay)
+
+    # --- Источник 2: Yahoo Download (fallback) ---
+    try:
+        logger.info("Пробуем Yahoo Download fallback")
+        url = (
+            f"https://query1.finance.yahoo.com/v7/finance/download/{SYMBOL}"
+            f"?period1={int(time.time()) - 365*86400*2}"
+            f"&period2={int(time.time())}"
+            f"&interval=1d&events=history"
+        )
+        df = pd.read_csv(url, storage_options={"headers": headers})
+        df["Date"] = pd.to_datetime(df["Date"])
+        df.set_index("Date", inplace=True)
+        logger.info(f"Цены получены через Yahoo Download ({len(df)} баров)")
+        return df
+    except Exception as e:
+        logger.warning(f"Источник 2 не сработал: {e}")
+
+    # --- Источник 3: Stooq (полностью независимый, без лимитов) ---
+    try:
+        logger.info("Пробуем Stooq.com (резервный источник)")
+        url = f"https://stooq.com/q/d/l/?s=ng.f&i=d&d1={datetime.now().strftime('%Y%m%d')}&d2=20200101"
+        df = pd.read_csv(url)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df.set_index("Date", inplace=True)
+        # Stooq отдаёт колонки: Date,Open,High,Low,Close,Volume
+        if "Close" in df.columns:
+            logger.info(f"Цены получены через Stooq ({len(df)} баров)")
+            return df
+        raise ValueError("Нет колонки Close в данных Stooq")
+    except Exception as e:
+        logger.error(f"Все источники цен недоступны: {e}")
+        raise
+
 # ============================================================
 # МОДУЛЬ 2: ИНДИКАТОРЫ
 # ============================================================
