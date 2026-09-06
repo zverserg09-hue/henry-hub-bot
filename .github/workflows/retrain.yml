@@ -1,0 +1,38 @@
+name: ML Retrain Henry Hub
+
+on:
+  schedule:
+    - cron: '0 3 1 * *'  # каждый 1-й день месяца в 03:00 UTC
+  workflow_dispatch:  # ручной запуск кнопкой в Actions
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy scikit-learn joblib requests
+
+      - name: Run ML training
+        run: python ml_train.py
+
+      - name: Commit and push updated model
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add ml_model_henry_hub.joblib ml_config.json
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update ML model for Henry Hub"
+            git push
+          fi
+
