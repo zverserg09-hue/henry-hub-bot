@@ -1,6 +1,6 @@
 """
 Henry Hub Natural Gas — автоматическая система сигналов
-Версия с жёсткими таймаутами, кэшированием и обработкой 429
+Источник цен: EIA API v2 (дневные спотовые цены Henry Hub)
 """
 
 import os
@@ -21,15 +21,16 @@ STORAGE_CURRENT_BCF = float(os.environ.get("STORAGE_CURRENT_BCF", "3153"))
 LAST_STORAGE_BUILD = float(os.environ.get("LAST_STORAGE_BUILD", "15"))
 STORAGE_FORECAST = float(os.environ.get("STORAGE_FORECAST", "19"))
 
-SYMBOL = "NG=F"
 LOG_FILE = "henry_hub_signals.log"
-
-CME_START_HOUR_MSK = 16
-CME_END_HOUR_MSK = 23
-REGULAR_INTERVAL_HOURS = 4
+CACHE_FILE = "cache_eia_ng_prices.csv"
 
 LAST_SIGNAL_FILE = "last_signal.json"
 REQUEST_TIMEOUT_SECONDS = 10
+
+# EIA Series ID: Henry Hub Natural Gas Spot Price, Daily
+EIA_PRICE_SERIES_ID = "NG.RNGWHHD.D"
+# EIA Series ID: Weekly Natural Gas Storage Report
+EIA_STORAGE_SERIES_ID = "NG.NW2_EPG0_SGO_RNG_RNGFM_WUS"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,38 +44,38 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# МОДУЛЬ 1: ЦЕНОВЫЕ ДАННЫЕ (с кэшем и обработкой 429)
+# МОДУЛЬ 1: ЦЕНОВЫЕ ДАННЫЕ (EIA API v2)
 # ============================================================
 
-CACHE_FILE = "cache_prices_ng.csv"
-
-
-def fetch_prices(symbol=SYMBOL, days=365 * 2, max_retries=3):
+def fetch_prices(max_retries=3):
     """
-    Загружает цены через JSON-эндпоинт Yahoo с обработкой 429 и кэшированием.
+    Загружает дневные спотовые цены Henry Hub из EIA API v2.
+    Поскольку EIA отдаёт только одну цену в день (spot),
+    Open=High=Low=Close=price, Volume=1.
     Возвращает DataFrame с индексом Date.
     """
-    logger.info(f"Начинаем загрузку цен для {symbol}")
+    logger.info("Начинаем загрузку цен Henry Hub из EIA API")
 
-    # 1. Проверяем кэш
+    if not EIA_API_KEY:
+        logger.error("EIA_API_KEY не задан. Невозможно загрузить цены.")
+        return pd.DataFrame()
+
+    # 1. Проверяем кэш (свежее ли он — моложе 24 часов)
     if os.path.exists(CACHE_FILE):
         file_age = time.time() - os.path.getmtime(CACHE_FILE)
         if file_age < 24 * 3600:
             try:
                 df = pd.read_csv(CACHE_FILE, index_col="Date", parse_dates=["Date"])
-                logger.info("Данные загружены из кэша (свежие).")
-                return df
+                if not df.empty:
+                    logger.info(f"Данные загружены из кэша ({len(df)} записей).")
+                    return df
             except Exception as e:
                 logger.warning(f"Не удалось прочитать кэш: {e}. Запрашиваем заново.")
 
-    # 2. Запрос к Yahoo с повторами при 429
-    now = int(time.time())
-    period1 = now - days * 86400
-    period2 = now
-
+    # 2. Запрос к EIA через /seriesid/ (совместимость с v1 Series ID)
     url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        f"?period1={period1}&period2={period2}&interval=1d"
+        f"https://api.eia.gov/v2/seriesid/{EIA_PRICE_SERIES_ID}"
+        f"?api_key={EIA_API_KEY}"
     )
 
     r = None
@@ -83,25 +84,20 @@ def fetch_prices(symbol=SYMBOL, days=365 * 2, max_retries=3):
             r = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
 
             if r.status_code == 200:
-                logger.info("Цены получены через основной эндпоинт.")
+                logger.info("Цены получены от EIA API.")
                 break
 
             if r.status_code == 429:
-                retry_after = r.headers.get("Retry-After")
-                delay = 60
-                if retry_after:
-                    try:
-                        delay = int(retry_after)
-                    except ValueError:
-                        delay = 60
+                retry_after = r.headers.get("Retry-After", "60")
+                delay = int(retry_after) if str(retry_after).isdigit() else 60
                 logger.warning(
-                    f"429 от Yahoo. Ждём {delay} сек (попытка {attempt + 1}/{max_retries})..."
+                    f"429 от EIA. Ждём {delay} сек (попытка {attempt + 1}/{max_retries})..."
                 )
                 time.sleep(delay)
                 continue
 
             logger.error(
-                f"Ошибка Yahoo API: статус {r.status_code}, ответ: {r.text[:200]}"
+                f"Ошибка EIA API: статус {r.status_code}, ответ: {r.text[:200]}"
             )
             if attempt == max_retries - 1:
                 return pd.DataFrame()
@@ -116,44 +112,81 @@ def fetch_prices(symbol=SYMBOL, days=365 * 2, max_retries=3):
     # 3. Парсим JSON
     try:
         data = r.json()
-        chart = data.get("chart", {})
-        result = chart.get("result", [])
 
-        if not result:
-            logger.error("В ответе Yahoo нет данных (result пуст).")
+        # Пробуем v1-style формат (series[0].data — массив [date, value])
+        series_data = None
+        if "series" in data and len(data["series"]) > 0:
+            series_data = data["series"][0]["data"]
+        # Пробуем v2 native формат (response.data — массив объектов)
+        elif "response" in data and "data" in data["response"]:
+            raw = data["response"]["data"]
+            series_data = [[item["period"], item["value"]] for item in raw]
+
+        if not series_data:
+            logger.error("В ответе EIA нет данных о ценах.")
             return pd.DataFrame()
 
-        res = result[0]
-        timestamps = res.get("timestamp", [])
-        quotes = res.get("indicators", {}).get("quote", [{}])[0]
+        # Парсим даты и значения
+        dates = []
+        prices = []
+        for entry in series_data:
+            date_str = str(entry[0])
+            price_raw = entry[1]
 
-        if len(timestamps) == 0:
-            logger.error("Нет временных меток в ответе Yahoo.")
+            if price_raw is None or price_raw == "":
+                continue
+
+            try:
+                price = float(price_raw)
+            except (ValueError, TypeError):
+                continue
+
+            # EIA возвращает даты в разных форматах: "20240101" или "2024-01-01"
+            try:
+                if "-" in date_str:
+                    d = pd.to_datetime(date_str)
+                else:
+                    d = pd.to_datetime(date_str, format="%Y%m%d")
+            except Exception:
+                try:
+                    d = pd.to_datetime(date_str)
+                except Exception:
+                    continue
+
+            dates.append(d)
+            prices.append(price)
+
+        if not dates:
+            logger.error("Нет валидных цен в ответе EIA.")
             return pd.DataFrame()
 
-        def safe_get(key):
-            arr = quotes.get(key, [])
-            return arr[: len(timestamps)]
-
+        # EIA отдаёт данные от новых к старым — сортируем по возрастанию
         df = pd.DataFrame(
             {
-                "Date": [datetime.fromtimestamp(t) for t in timestamps],
-                "Open": safe_get("open"),
-                "High": safe_get("high"),
-                "Low": safe_get("low"),
-                "Close": safe_get("close"),
-                "Volume": safe_get("volume"),
+                "Date": dates,
+                "Open": prices,
+                "High": prices,
+                "Low": prices,
+                "Close": prices,
+                "Volume": [1] * len(prices),  # нет реального объёма — ставим 1
             }
         )
         df.dropna(inplace=True)
+        df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
         df.set_index("Date", inplace=True)
+        df.sort_index(inplace=True)
 
+        # Оставляем последние 2 года
+        cutoff = datetime.now() - timedelta(days=730)
+        df = df[df.index >= cutoff]
+
+        # Сохраняем в кэш
         df.to_csv(CACHE_FILE, index=True)
-        logger.info("Данные получены от Yahoo и сохранены в кэш.")
+        logger.info(f"Данные получены от EIA и сохранены в кэш ({len(df)} записей).")
         return df
 
     except Exception as e:
-        logger.error(f"Ошибка парсинга JSON от Yahoo: {e}")
+        logger.error(f"Ошибка парсинга JSON от EIA: {e}")
         return pd.DataFrame()
 
 
@@ -166,31 +199,33 @@ def calc_indicators(df):
     logger.info("Расчёт технических индикаторов")
     close = df["Close"]
 
+    # RSI-14
     delta = close.diff()
     gain = delta.where(delta > 0, 0).rolling(window=14).mean()
     loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
     rs = gain / loss
     rsi = (100 - (100 / (1 + rs))).iloc[-1]
 
+    # Moving Averages
     ma50 = close.rolling(50).mean().iloc[-1]
     ma200 = close.rolling(200).mean().iloc[-1]
 
+    # Bollinger Bands
     bb_mid = close.rolling(20).mean()
     bb_std = close.rolling(20).std()
     bb_upper = (bb_mid + 2 * bb_std).iloc[-1]
     bb_lower = (bb_mid - 2 * bb_std).iloc[-1]
 
+    # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     signal_line = macd.ewm(span=9, adjust=False).mean()
     macd_hist = (macd - signal_line).iloc[-1]
 
-    high, low = df["High"], df["Low"]
-    tr = np.maximum(
-        np.maximum(high - low, np.abs(high - close.shift(1))),
-        np.abs(low - close.shift(1)),
-    )
+    # ATR: поскольку H=L=C (spot price), True Range = |Close - Close_prev|
+    # Это упрощённый ATR — среднее абсолютное изменение цены за 14 дней
+    tr = np.abs(close - close.shift(1))
     atr = tr.rolling(14).mean().iloc[-1]
 
     return {
@@ -214,9 +249,13 @@ def seasonality_score(month):
 
 
 def find_swing_levels(df, swing_bars=6):
+    """
+    Ищет уровни поддержки и сопротивления по экстремумам.
+    Поскольку H=L=C (spot price), используются Close как High и Low.
+    """
     data = df.tail(120)
-    highs = data["High"].values
-    lows = data["Low"].values
+    highs = data["Close"].values  # используем Close вместо High
+    lows = data["Close"].values   # используем Close вместо Low
 
     resistance = []
     support = []
@@ -233,8 +272,14 @@ def find_swing_levels(df, swing_bars=6):
 
 
 def calc_pivots(df):
-    last = df.iloc[-1]
-    h, l, c = last["High"], last["Low"], last["Close"]
+    """
+    Считает пивот-уровни. Поскольку H=L=C (spot price),
+    используем диапазон за последние 5 дней как proxy для H/L.
+    """
+    recent = df.tail(5)
+    h = recent["Close"].max()
+    l = recent["Close"].min()
+    c = df.iloc[-1]["Close"]
     p = (h + l + c) / 3
     return {
         "P": p,
@@ -246,12 +291,16 @@ def calc_pivots(df):
 
 
 def volume_profile(df, lookback=60, num_bins=40):
+    """
+    Профиль объёма. Поскольку реального объёма нет (Volume=1),
+    это фактически профиль частоты цен — где цена проводила больше всего дней.
+    """
     data = df.tail(lookback)
     if len(data) == 0:
         return {"poc": 0, "val": 0, "vah": 0, "hvn": []}
 
-    min_p = data["Low"].min()
-    max_p = data["High"].max()
+    min_p = data["Close"].min()
+    max_p = data["Close"].max()
     if min_p == max_p:
         return {"poc": min_p, "val": min_p, "vah": min_p, "hvn": [min_p]}
 
@@ -261,6 +310,8 @@ def volume_profile(df, lookback=60, num_bins=40):
     for _, row in data.iterrows():
         price = row["Close"]
         vol = row.get("Volume", 1)
+        if vol == 0:
+            vol = 1
         for b in range(num_bins):
             if bins[b] <= price < bins[b + 1]:
                 vol_by_bin[b] += vol
@@ -273,6 +324,7 @@ def volume_profile(df, lookback=60, num_bins=40):
     if total_vol == 0:
         return {"poc": poc, "val": min_p, "vah": max_p, "hvn": [poc]}
 
+    # Value Area: 70% от общего объёма (как в TradingView)
     cum = 0
     val_idx, vah_idx = 0, num_bins - 1
     for b in range(num_bins):
@@ -345,7 +397,7 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
 
 
 # ============================================================
-# МОДУЛЬ 3: ДАННЫЕ EIA
+# МОДУЛЬ 3: ДАННЫЕ EIA (запасы)
 # ============================================================
 
 
@@ -356,30 +408,42 @@ def get_eia_storage():
 
     try:
         url = (
-            f"https://api.eia.gov/v2/seriesid/NG.NW2_EPG0_SGO_RNG_RNGFM_WUS"
+            f"https://api.eia.gov/v2/seriesid/{EIA_STORAGE_SERIES_ID}"
             f"?api_key={EIA_API_KEY}"
         )
         r = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
         r.raise_for_status()
         data = r.json()
-        values = data["series"][0]["data"]
+
+        # Пробуем v1-style и v2-style форматы
+        values = None
+        if "series" in data and len(data["series"]) > 0:
+            values = data["series"][0]["data"]
+        elif "response" in data and "data" in data["response"]:
+            raw = data["response"]["data"]
+            values = [[item["period"], item["value"]] for item in raw]
+
+        if not values:
+            logger.warning("EIA Storage: нет данных в ответе.")
+            return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
+
         current = float(values[0][1])
         prev = float(values[1][1])
         build = current - prev
         logger.info(f"EIA Storage: current={current}, build={build}")
         return current, build, STORAGE_FORECAST
     except Exception as e:
-        logger.error(f"Ошибка EIA API: {e}")
+        logger.error(f"Ошибка EIA API (storage): {e}")
         return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
 
 
 def score_storage(storage_bcf, build, forecast):
     """
-    Считает скоринг по запасам газа (от -3 до +3) и формирует пояснительное сообщение.
-    Логика: отклонение от 5-летней средней + сюрприз по закачке относительно прогноза.
+    Скоринг по запасам газа (от -3 до +3).
+    Логика: отклонение от 5-летней средней + сюрприз по закачке.
     """
     score = 0
-    avg_5yr = 3000  # упрощённая 5-летняя средняя (Bcf)
+    avg_5yr = 3000
     pct = ((storage_bcf - avg_5yr) / avg_5yr) * 100
     msg = f"Текущие: {storage_bcf:.0f} Bcf ({pct:+.1f}% к 5л ср.)\n"
 
@@ -411,7 +475,6 @@ def score_storage(storage_bcf, build, forecast):
 def parse_news():
     """
     Парсит RSS-ленты на свежие новости по газу/энергии за последние 6 часов.
-    Возвращает список заголовков (не более 5 штук).
     """
     feeds = [
         "https://www.naturalgasintelligence.com/feed/",
@@ -520,18 +583,20 @@ def send_telegram(message, max_retries=3):
 
 
 def main():
-    logger.info("=== START HENRY HUB SIGNALS ===")
+    logger.info("=== START HENRY HUB SIGNALS (EIA) ===")
 
     # 1. Цены
     try:
         df = fetch_prices()
         if df.empty:
-            logger.critical("Не удалось загрузить цены (пустой DataFrame).")
+            logger.critical("Не удалось загрузить цены из EIA (пустой DataFrame).")
             send_telegram(
-                "❌ Henry Hub: ошибка загрузки цен\nYahoo вернул пустые данные или 429."
+                "❌ Henry Hub: ошибка загрузки цен\n"
+                "EIA API вернул пустые данные. "
+                "Проверьте EIA_API_KEY в Secrets."
             )
             return
-        logger.info(f"Loaded {len(df)} price bars")
+        logger.info(f"Loaded {len(df)} price bars (EIA daily spot)")
     except Exception as e:
         logger.critical(f"Cannot load prices: {e}")
         send_telegram(f"❌ Henry Hub: ошибка загрузки цен\n{e}")
@@ -540,7 +605,8 @@ def main():
     # 2. Индикаторы
     ind = calc_indicators(df)
     logger.info(
-        f"Indicators calculated: RSI={ind['rsi']:.2f}, Price=${ind['price']:.3f}"
+        f"Indicators: RSI={ind['rsi']:.2f}, Price=${ind['price']:.3f}, "
+        f"MA50=${ind['ma50']:.3f}, MA200=${ind['ma200']:.3f}"
     )
 
     # 3. Уровни
@@ -564,13 +630,17 @@ def main():
         else "📰 Новостей за 6 часов нет"
     )
 
-    # 6. Итоговый скоринг и сообщение
+    # 6. Итоговый скоринг
     total_score = level_score + storage_score
     score_emoji = "🟢" if total_score > 0 else "🔴" if total_score < 0 else "⚪"
 
+    # Дата последней свечи
+    last_date = df.index[-1].strftime("%Y-%m-%d")
+
     report = (
         f"{score_emoji} **Henry Hub Signals** (Score: {total_score})\n\n"
-        f"💵 Цена: ${ind['price']:.3f}\n"
+        f"💵 Цена (EIA spot): ${ind['price']:.3f}\n"
+        f"📅 Последняя дата данных: {last_date}\n"
         f"📈 RSI-14: {ind['rsi']:.2f} | MA50: ${ind['ma50']:.3f} | MA200: ${ind['ma200']:.3f}\n\n"
         f"{levels_msg}\n"
         f"{storage_msg}\n"
