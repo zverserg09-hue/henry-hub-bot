@@ -580,8 +580,6 @@ def send_telegram(message, max_retries=3):
 # ============================================================
 # МОДУЛЬ 6: MAIN
 # ============================================================
-
-
 def main():
     logger.info("=== START HENRY HUB SIGNALS (EIA) ===")
 
