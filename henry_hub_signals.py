@@ -4,17 +4,18 @@ Henry Hub Natural Gas — автоматическая система сигна
   1. EIA API v2 — спотовые цены Henry Hub (основной, всегда работает)
   2. Yahoo Finance (NG=F) — фьючерсные котировки (доп., при недоступности игнорируется)
 
+Логика отправки: только при изменении сигнала (Score, направление, уровни сделки)
 Сигнал: СИЛЬНЫЙ ШОРТ / ШОРТ / НЕЙТРАЛЬНО / ЛОНГ / СИЛЬНЫЙ ЛОНГ
 Уровни сделки: через ATR (стоп 1.5×ATR, TP1 2×ATR, TP2 4×ATR)
 Скоринг: 8 факторов (от -8 до +8)
 """
 
 import os
-import re
-import time
 import json
+import time
 import logging
 from datetime import datetime, timedelta
+
 import requests
 import pandas as pd
 import numpy as np
@@ -31,6 +32,7 @@ STORAGE_FORECAST = float(os.environ.get("STORAGE_FORECAST", "19"))
 LOG_FILE = "henry_hub_signals.log"
 CACHE_EIA_FILE = "cache_eia_ng_prices.csv"
 CACHE_YAHOO_FILE = "cache_yahoo_ng_prices.csv"
+LAST_SIGNAL_FILE = "last_signal.json"
 REQUEST_TIMEOUT = 15
 
 logging.basicConfig(
@@ -45,6 +47,50 @@ YAHOO_SYMBOL = "NG=F"
 
 
 # ============================================================
+# МОДУЛЬ 0: КЭШ ПОСЛЕДНЕГО СИГНАЛА
+# ============================================================
+
+def load_last_signal():
+    """Загружает последний отправленный сигнал из JSON."""
+    if not os.path.exists(LAST_SIGNAL_FILE):
+        return None
+    try:
+        with open(LAST_SIGNAL_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"Не удалось загрузить last_signal.json: {e}")
+        return None
+
+
+def save_last_signal(signal_data):
+    """Сохраняет текущий сигнал в JSON."""
+    try:
+        with open(LAST_SIGNAL_FILE, "w") as f:
+            json.dump(signal_data, f, indent=2)
+        logger.info(f"Сигнал сохранён в {LAST_SIGNAL_FILE}")
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить last_signal.json: {e}")
+
+
+def signal_changed(current, last):
+    """Сравнивает текущий сигнал с прошлым.
+    Возвращает True, если сигнал изменился (или прошлого нет)."""
+    if last is None:
+        return True
+
+    keys_to_compare = [
+        "score", "signal_text", "price", "stop", "tp1", "tp2",
+    ]
+    for key in keys_to_compare:
+        cur_val = current.get(key)
+        last_val = last.get(key)
+        if cur_val != last_val:
+            return True
+
+    return False
+
+
+# ============================================================
 # МОДУЛЬ 1A: ЦЕНЫ EIA (спот, дневные)
 # ============================================================
 
@@ -56,7 +102,6 @@ def fetch_eia_prices(max_retries=3):
         logger.warning("EIA_API_KEY не задан — цены EIA недоступны.")
         return pd.DataFrame()
 
-    # Кэш (свежесть 24 ч)
     if os.path.exists(CACHE_EIA_FILE):
         file_age = time.time() - os.path.getmtime(CACHE_EIA_FILE)
         if file_age < 24 * 3600:
@@ -162,7 +207,6 @@ def fetch_yahoo_prices(max_retries=3):
 
     logger.info("→ Загрузка цен Yahoo Finance (NG=F)...")
 
-    # Кэш (свежесть 6 ч — Yahoo обновляется чаще)
     if os.path.exists(CACHE_YAHOO_FILE):
         file_age = time.time() - os.path.getmtime(CACHE_YAHOO_FILE)
         if file_age < 6 * 3600:
@@ -286,7 +330,6 @@ def build_combined_dataset(df_eia, df_yahoo):
     if not df_yahoo.empty:
         price_yahoo = df_yahoo["Close"].iloc[-1]
 
-    # Выбор основного датафрейма для индикаторов
     if not df_yahoo.empty:
         df_main = df_yahoo.copy()
         source_name = "Yahoo (NG=F фьючерс)"
@@ -298,12 +341,11 @@ def build_combined_dataset(df_eia, df_yahoo):
     else:
         return pd.DataFrame(), None, None
 
-    # Если есть оба — дополняем EIA-данными те даты, которых нет в Yahoo
     if not df_eia.empty and not df_yahoo.empty:
         missing_dates = df_eia.index.difference(df_yahoo.index)
         if len(missing_dates) > 0:
-            df补充 = df_eia.loc[missing_dates].copy()
-            df_main = pd.concat([df_main, df补充])
+            df_extra = df_eia.loc[missing_dates].copy()
+            df_main = pd.concat([df_main, df_extra])
             df_main = df_main[~df_main.index.duplicated(keep="last")]
             df_main.sort_index(inplace=True)
             logger.info(f"  Дополнено {len(missing_dates)} записями из EIA.")
@@ -318,33 +360,27 @@ def build_combined_dataset(df_eia, df_yahoo):
 def calc_indicators(df, has_real_ohlc=False):
     close = df["Close"]
 
-    # RSI-14
     delta = close.diff()
     gain = delta.where(delta > 0, 0).rolling(window=14).mean()
     loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
     rs = gain / loss
     rsi = (100 - (100 / (1 + rs))).iloc[-1]
 
-    # MA
     ma50 = close.rolling(50).mean().iloc[-1]
     ma200 = close.rolling(200).mean().iloc[-1]
 
-    # Bollinger Bands
     bb_mid = close.rolling(20).mean()
     bb_std = close.rolling(20).std()
     bb_upper = (bb_mid + 2 * bb_std).iloc[-1]
     bb_lower = (bb_mid - 2 * bb_std).iloc[-1]
 
-    # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     signal_line = macd.ewm(span=9, adjust=False).mean()
     macd_hist = (macd - signal_line).iloc[-1]
 
-    # ATR
     if has_real_ohlc:
-        # Настоящий ATR через High/Low/Close
         high = df["High"]
         low = df["Low"]
         tr = pd.concat(
@@ -358,7 +394,6 @@ def calc_indicators(df, has_real_ohlc=False):
         atr = tr.rolling(14).mean().iloc[-1]
         logger.info(f"  ATR (реальный OHLC): {atr:.4f}")
     else:
-        # Упрощённый ATR через |Close - Close_prev|, множитель 1.5
         tr = close.diff().abs()
         atr = tr.rolling(14).mean().iloc[-1] * 1.5
         logger.info(f"  ATR (упрощённый ×1.5): {atr:.4f}")
@@ -533,8 +568,7 @@ def get_eia_storage():
 # ============================================================
 
 def parse_news():
-    """Заглушка — возвращает пустой список.
-    Здесь можно подключить RSS-ленту или API новостей."""
+    """Заглушка — возвращает пустой список."""
     return []
 
 
@@ -547,9 +581,7 @@ def send_telegram(text):
         logger.warning("Telegram: токен или chat_id не заданы — пропуск.")
         return
 
-    url = (
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
@@ -596,7 +628,6 @@ def main():
         send_telegram("❌ Henry Hub: нет данных для анализа.")
         return
 
-    # Определяем, есть ли реальные OHLC (от Yahoo)
     has_real_ohlc = not df_yahoo.empty
 
     # 3. Индикаторы
@@ -723,15 +754,15 @@ def main():
         signal_text = "⚪ НЕЙТРАЛЬНО / ВНЕ ПОЗИЦИИ"
 
     # ============================================================
-    # 9. УРОВНИ СДЕЛКИ (ATR × 1.5 при отсутствии реального OHLC)
+    # 9. УРОВНИ СДЕЛКИ (ATR)
     # ============================================================
     atr = ind["atr"]
-    if not has_real_ohlc:
-        atr = atr  # уже умножено на 1.5 в calc_indicators
-    else:
-        atr = atr * 1.0  # реальный ATR, множитель не нужен
 
+    stop = None
+    tp1 = None
+    tp2 = None
     trade_msg = ""
+
     if score <= -2:
         stop = price + 1.5 * atr
         tp1 = price - 2 * atr
@@ -764,12 +795,40 @@ def main():
         trade_msg = "📌 Уровней нет — сигнал слабый, жди подтверждения\n"
 
     # ============================================================
-    # 10. ОТЧЁТ
+    # 10. ПРОВЕРКА: ИЗМЕНИЛСЯ ЛИ СИГНАЛ
+    # ============================================================
+    current_signal = {
+        "score": score,
+        "signal_text": signal_text,
+        "price": round(price, 3),
+        "stop": round(stop, 3) if stop is not None else None,
+        "tp1": round(tp1, 3) if tp1 is not None else None,
+        "tp2": round(tp2, 3) if tp2 is not None else None,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    last_signal = load_last_signal()
+
+    if not signal_changed(current_signal, last_signal):
+        logger.info(
+            f"Сигнал не изменился (Score: {score}, {signal_text}). "
+            f"Отправка в Telegram пропущена."
+        )
+        return
+
+    logger.info(
+        f"Сигнал изменился! "
+        f"Был: {last_signal['signal_text'] if last_signal else 'нет'} "
+        f"(Score: {last_signal['score'] if last_signal else 'нет'}), "
+        f"стал: {signal_text} (Score: {score})"
+    )
+
+    # ============================================================
+    # 11. ОТЧЁТ
     # ============================================================
     factors_msg = "\n".join([f"   {f}" for f in factors])
     last_date = df_merged.index[-1].strftime("%Y-%m-%d")
 
-    # Строка цен (оба источника, если доступны)
     price_lines = ""
     if price_eia is not None:
         price_lines += f"💵 Спот (EIA): ${price_eia:.3f}\n"
@@ -794,6 +853,10 @@ def main():
 
     logger.info(f"Signal: {signal_text}, Score: {score}")
     send_telegram(report)
+
+    # Сохраняем текущий сигнал
+    save_last_signal(current_signal)
+
     logger.info("=== END HENRY HUB SIGNALS ===")
 
 
