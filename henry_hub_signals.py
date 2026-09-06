@@ -586,41 +586,29 @@ def main():
     logger.info("=== START HENRY HUB SIGNALS (EIA) ===")
 
     # 1. Цены
-    try:
-        df = fetch_prices()
-        if df.empty:
-            logger.critical("Не удалось загрузить цены из EIA (пустой DataFrame).")
-            send_telegram(
-                "❌ Henry Hub: ошибка загрузки цен\n"
-                "EIA API вернул пустые данные. "
-                "Проверьте EIA_API_KEY в Secrets."
-            )
-            return
-        logger.info(f"Loaded {len(df)} price bars (EIA daily spot)")
-    except Exception as e:
-        logger.critical(f"Cannot load prices: {e}")
-        send_telegram(f"❌ Henry Hub: ошибка загрузки цен\n{e}")
+    df = fetch_prices()
+    if df.empty:
+        logger.critical("Не удалось загрузить цены из EIA.")
+        send_telegram(
+            "❌ Henry Hub: ошибка загрузки цен\n"
+            "EIA API вернул пустые данные. Проверьте EIA_API_KEY."
+        )
         return
+    logger.info(f"Loaded {len(df)} price bars (EIA daily spot)")
 
     # 2. Индикаторы
     ind = calc_indicators(df)
-    logger.info(
-        f"Indicators: RSI={ind['rsi']:.2f}, Price=${ind['price']:.3f}, "
-        f"MA50=${ind['ma50']:.3f}, MA200=${ind['ma200']:.3f}"
-    )
 
     # 3. Уровни
     support_lvls, resistance_lvls = find_swing_levels(df)
     pivots = calc_pivots(df)
     vp = volume_profile(df)
-
-    levels_msg, level_score, nearest_sup, nearest_res = format_levels_message(
+    levels_msg, nearest_sup, nearest_res = format_levels_message(
         ind["price"], vp, support_lvls, resistance_lvls, pivots
     )
 
     # 4. Запасы EIA
     storage_bcf, build, forecast = get_eia_storage()
-    storage_score, storage_msg = score_storage(storage_bcf, build, forecast)
 
     # 5. Новости
     news_titles = parse_news()
@@ -630,35 +618,173 @@ def main():
         else "📰 Новостей за 6 часов нет"
     )
 
-    # 6. Итоговый скоринг и понятная рекомендация
-    total_score = level_score + storage_score
+    # ============================================================
+    # 6. СКОРИНГ — 8 ФАКТОРОВ (от -8 до +8)
+    # ============================================================
+    score = 0
+    factors = []
 
-    if total_score <= -2:
-        signal_text = "🔴 СИЛЬНЫЙ ШОРТ"
-        signal_emoji = "🔴"
-    elif total_score >= 2:
-        signal_text = "🟢 СИЛЬНЫЙ ЛОНГ"
-        signal_emoji = "🟢"
+    # Фактор 1: RSI дневной
+    if ind["rsi"] >= 70:
+        score -= 1
+        factors.append(f"RSI {ind['rsi']:.1f} — перекупленность → -1")
+    elif ind["rsi"] <= 30:
+        score += 1
+        factors.append(f"RSI {ind['rsi']:.1f} — перепроданность → +1")
     else:
-        signal_text = "⚪ НЕЙТРАЛЬНО / БОКОВИК"
-        signal_emoji = "⚪"
+        factors.append(f"RSI {ind['rsi']:.1f} — нейтрально → 0")
 
-    # Дата последней свечи
+    # Фактор 2: Цена vs MA50
+    if ind["price"] > ind["ma50"]:
+        score += 1
+        factors.append(f"Цена > MA50 ${ind['ma50']:.3f} → +1")
+    else:
+        score -= 1
+        factors.append(f"Цена < MA50 ${ind['ma50']:.3f} → -1")
+
+    # Фактор 3: Цена vs MA200
+    if ind["price"] > ind["ma200"]:
+        score += 1
+        factors.append(f"Цена > MA200 ${ind['ma200']:.3f} → +1")
+    else:
+        score -= 1
+        factors.append(f"Цена < MA200 ${ind['ma200']:.3f} → -1")
+
+    # Фактор 4: Bollinger Bands
+    if ind["price"] >= ind["bb_upper"]:
+        score -= 1
+        factors.append(f"Цена у верхней BB ${ind['bb_upper']:.3f} → -1")
+    elif ind["price"] <= ind["bb_lower"]:
+        score += 1
+        factors.append(f"Цена у нижней BB ${ind['bb_lower']:.3f} → +1")
+    else:
+        factors.append("Цена внутри BB → 0")
+
+    # Фактор 5: MACD гистограмма
+    if ind["macd_hist"] > 0:
+        score += 1
+        factors.append("MACD гист. > 0 → +1")
+    else:
+        score -= 1
+        factors.append("MACD гист. < 0 → -1")
+
+    # Фактор 6: Сезонность
+    month = datetime.now().month
+    seas = seasonality_score(month)
+    score += seas
+    seas_word = "бычий" if seas > 0 else "медвежий" if seas < 0 else "нейтральный"
+    factors.append(f"Сезон ({seas_word}) → {seas:+d}")
+
+    # Фактор 7: Запасы (отклонение от 5-летней средней)
+    avg_5yr = 3000
+    pct = ((storage_bcf - avg_5yr) / avg_5yr) * 100
+    if pct > 5:
+        score -= 2
+        factors.append(f"Запасы +{pct:.1f}% к норме → -2")
+    elif pct < -5:
+        score += 2
+        factors.append(f"Запасы {pct:.1f}% к норме → +2")
+    else:
+        factors.append(f"Запасы {pct:+.1f}% к норме → 0")
+
+    # Фактор 8: Закачка vs прогноз
+    if build > 0 and forecast > 0:
+        if build > forecast * 1.3:
+            score -= 1
+            factors.append(f"Закачка {build:.0f} > прогноз {forecast:.0f} → -1")
+        elif build < forecast * 0.7:
+            score += 1
+            factors.append(f"Закачка {build:.0f} < прогноз {forecast:.0f} → +1")
+        else:
+            factors.append("Закачка ≈ прогноз → 0")
+    else:
+        factors.append("Закачка/прогноз: нет данных → 0")
+
+    # ============================================================
+    # 7. СИГНАЛ
+    # ============================================================
+    if score <= -4:
+        signal_text = "🔴 СИЛЬНЫЙ ШОРТ"
+    elif score <= -2:
+        signal_text = "🟠 ШОРТ"
+    elif score >= 4:
+        signal_text = "🟢 СИЛЬНЫЙ ЛОНГ"
+    elif score >= 2:
+        signal_text = "🟢 ЛОНГ"
+    elif score >= 1:
+        signal_text = "🟡 СЛАБЫЙ ЛОНГ"
+    elif score <= -1:
+        signal_text = "🟡 СЛАБЫЙ ШОРТ"
+    else:
+        signal_text = "⚪ НЕЙТРАЛЬНО / ВНЕ ПОЗИЦИИ"
+
+    # ============================================================
+    # 8. УРОВНИ СДЕЛКИ (ATR × 1.5 — компенсация заниженного ATR)
+    # ============================================================
+    atr_adj = ind["atr"] * 1.5
+    price = ind["price"]
+
+    trade_msg = ""
+    if score <= -2:
+        # Шорт: стоп выше, тейки ниже
+        stop = price + atr_adj
+        tp1 = price - 2 * atr_adj
+        tp2 = price - 4 * atr_adj
+        risk = (stop - price) / price * 100
+        rr = abs(tp1 - price) / abs(stop - price)
+        trade_msg = (
+            f"📌 Уровни (шорт):\n"
+            f"   Вход: ${price:.3f}\n"
+            f"   Стоп: ${stop:.3f} (риск {risk:.1f}%)\n"
+            f"   TP1: ${tp1:.3f}\n"
+            f"   TP2: ${tp2:.3f}\n"
+            f"   R/R: {rr:.2f}\n"
+        )
+    elif score >= 2:
+        # Лонг: стоп ниже, тейки выше
+        stop = price - atr_adj
+        tp1 = price + 2 * atr_adj
+        tp2 = price + 4 * atr_adj
+        risk = (price - stop) / price * 100
+        rr = abs(tp1 - price) / abs(price - stop)
+        trade_msg = (
+            f"📌 Уровни (лонг):\n"
+            f"   Вход: ${price:.3f}\n"
+            f"   Стоп: ${stop:.3f} (риск {risk:.1f}%)\n"
+            f"   TP1: ${tp1:.3f}\n"
+            f"   TP2: ${tp2:.3f}\n"
+            f"   R/R: {rr:.2f}\n"
+        )
+    else:
+        trade_msg = "📌 Уровней нет — сигнал слабый, жди подтверждения\n"
+
+    # ============================================================
+    # 9. ОТЧЁТ
+    # ============================================================
+    factors_msg = "\n".join([f"   {f}" for f in factors])
     last_date = df.index[-1].strftime("%Y-%m-%d")
 
     report = (
-        f"{signal_emoji} **Henry Hub Signals — {signal_text}**\n\n"
-        f"💵 Цена (EIA spot): ${ind['price']:.3f}\n"
+        f"{signal_text} (Score: {score:+d}/8)\n\n"
+        f"💵 Цена (EIA spot): ${price:.3f}\n"
         f"📅 Последняя дата данных: {last_date}\n"
-        f"📈 RSI-14: {ind['rsi']:.2f} | MA50: ${ind['ma50']:.3f} | MA200: ${ind['ma200']:.3f}\n\n"
+        f"📈 RSI: {ind['rsi']:.1f} | MA50: ${ind['ma50']:.3f} | MA200: ${ind['ma200']:.3f}\n\n"
+        f"{trade_msg}\n"
         f"{levels_msg}\n"
-        f"{storage_msg}\n"
+        f"📊 Факторы:\n{factors_msg}\n\n"
+        f"Текущие: {storage_bcf:.0f} Bcf ({pct:+.1f}% к 5л ср.)\n"
+        f"⚖️ Закачка {build:.0f} Bcf, прогноз {forecast:.0f} Bcf\n\n"
         f"{news_msg}"
     )
 
-    logger.info("Report generated")
+    logger.info(f"Signal: {signal_text}, Score: {score}")
     send_telegram(report)
     logger.info("=== END HENRY HUB SIGNALS ===")
+
+
+if __name__ == "__main__":
+    main()
+
 
 
 
