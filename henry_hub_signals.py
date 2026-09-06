@@ -1,6 +1,6 @@
 """
 Henry Hub Natural Gas — автоматическая система сигналов
-Версия с жёсткими таймаутами и подробным логированием
+Версия с жёсткими таймаутами, кэшированием и обработкой 429
 """
 
 import os
@@ -41,13 +41,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ============================================================
-# МОДУЛЬ 1: ЦЕНОВЫЕ ДАННЫЕ (с защитой от зависания)
+# МОДУЛЬ 1: ЦЕНОВЫЕ ДАННЫЕ (с кэшем и обработкой 429)
 # ============================================================
 
 CACHE_FILE = "cache_prices_ng.csv"
 
-def fetch_prices(symbol=SYMBOL, days=365*2, max_retries=3):
+
+def fetch_prices(symbol=SYMBOL, days=365 * 2, max_retries=3):
     """
     Загружает цены через JSON-эндпоинт Yahoo с обработкой 429 и кэшированием.
     Возвращает DataFrame с индексом Date.
@@ -85,24 +87,28 @@ def fetch_prices(symbol=SYMBOL, days=365*2, max_retries=3):
                 break
 
             if r.status_code == 429:
-                retry_after = r.headers.get('Retry-After')
+                retry_after = r.headers.get("Retry-After")
                 delay = 60
                 if retry_after:
                     try:
                         delay = int(retry_after)
                     except ValueError:
                         delay = 60
-                logger.warning(f"429 от Yahoo. Ждём {delay} сек (попытка {attempt+1}/{max_retries})...")
+                logger.warning(
+                    f"429 от Yahoo. Ждём {delay} сек (попытка {attempt + 1}/{max_retries})..."
+                )
                 time.sleep(delay)
                 continue
 
-            logger.error(f"Ошибка Yahoo API: статус {r.status_code}, ответ: {r.text[:200]}")
+            logger.error(
+                f"Ошибка Yahoo API: статус {r.status_code}, ответ: {r.text[:200]}"
+            )
             if attempt == max_retries - 1:
                 return pd.DataFrame()
             time.sleep(5)
 
         except Exception as e:
-            logger.error(f"Сетевая ошибка (попытка {attempt+1}): {e}")
+            logger.error(f"Сетевая ошибка (попытка {attempt + 1}): {e}")
             if attempt == max_retries - 1:
                 return pd.DataFrame()
             time.sleep(5)
@@ -127,16 +133,18 @@ def fetch_prices(symbol=SYMBOL, days=365*2, max_retries=3):
 
         def safe_get(key):
             arr = quotes.get(key, [])
-            return arr[:len(timestamps)]
+            return arr[: len(timestamps)]
 
-        df = pd.DataFrame({
-            "Date": [datetime.fromtimestamp(t) for t in timestamps],
-            "Open": safe_get("open"),
-            "High": safe_get("high"),
-            "Low": safe_get("low"),
-            "Close": safe_get("close"),
-            "Volume": safe_get("volume"),
-        })
+        df = pd.DataFrame(
+            {
+                "Date": [datetime.fromtimestamp(t) for t in timestamps],
+                "Open": safe_get("open"),
+                "High": safe_get("high"),
+                "Low": safe_get("low"),
+                "Close": safe_get("close"),
+                "Volume": safe_get("volume"),
+            }
+        )
         df.dropna(inplace=True)
         df.set_index("Date", inplace=True)
 
@@ -152,6 +160,7 @@ def fetch_prices(symbol=SYMBOL, days=365*2, max_retries=3):
 # ============================================================
 # МОДУЛЬ 2: ИНДИКАТОРЫ
 # ============================================================
+
 
 def calc_indicators(df):
     logger.info("Расчёт технических индикаторов")
@@ -195,10 +204,15 @@ def calc_indicators(df):
         "atr": atr,
     }
 
+
 def seasonality_score(month):
-    scores = {1: 3, 2: 2, 3: 1, 4: -1, 5: -2, 6: -1,
-              7: 0, 8: -1, 9: -2, 10: -1, 11: 2, 12: 3}
+    scores = {
+        1: 3, 2: 2, 3: 1, 4: -1, 5: -2, 6: -1,
+        7: 0, 8: -1, 9: -2, 10: -1, 11: 2, 12: 3,
+    }
     return scores.get(month, 0)
+
+
 def find_swing_levels(df, swing_bars=6):
     data = df.tail(120)
     highs = data["High"].values
@@ -217,6 +231,7 @@ def find_swing_levels(df, swing_bars=6):
     sup_vals = sorted(set(support))
     return sup_vals, res_vals
 
+
 def calc_pivots(df):
     last = df.iloc[-1]
     h, l, c = last["High"], last["Low"], last["Close"]
@@ -228,6 +243,7 @@ def calc_pivots(df):
         "R2": p + (h - l),
         "S2": p - (h - l),
     }
+
 
 def volume_profile(df, lookback=60, num_bins=40):
     data = df.tail(lookback)
@@ -278,6 +294,8 @@ def volume_profile(df, lookback=60, num_bins=40):
     hvn = [(bins[i] + bins[i + 1]) / 2 for i in top_indices if vol_by_bin[i] > 0]
 
     return {"poc": poc, "val": val, "vah": vah, "hvn": hvn}
+
+
 def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     level_score = 0
     msg = ""
@@ -292,7 +310,7 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     if sups_below:
         nearest_sup = max(sups_below)
         dist = abs(price - nearest_sup) / price
-        msg += f"🟢 Поддержка: ${nearest_sup:.3f} ({dist*100:.1f}%)\n"
+        msg += f"🟢 Поддержка: ${nearest_sup:.3f} ({dist * 100:.1f}%)\n"
         if dist < 0.015:
             level_score += 1
     else:
@@ -302,7 +320,7 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     if ress_above:
         nearest_res = min(ress_above)
         dist = abs(nearest_res - price) / price
-        msg += f"🔴 Сопротивление: ${nearest_res:.3f} ({dist*100:.1f}%)\n"
+        msg += f"🔴 Сопротивление: ${nearest_res:.3f} ({dist * 100:.1f}%)\n"
         if dist < 0.015:
             level_score -= 1
     else:
@@ -325,13 +343,22 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
 
     return msg, level_score, nearest_sup, nearest_res
 
+
+# ============================================================
+# МОДУЛЬ 3: ДАННЫЕ EIA
+# ============================================================
+
+
 def get_eia_storage():
     if not EIA_API_KEY:
         logger.warning("EIA API KEY не задан, используем fallback-значения")
         return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
 
     try:
-        url = f"https://api.eia.gov/v2/seriesid/NG.NW2_EPG0_SGO_RNG_RNGFM_WUS?api_key={EIA_API_KEY}"
+        url = (
+            f"https://api.eia.gov/v2/seriesid/NG.NW2_EPG0_SGO_RNG_RNGFM_WUS"
+            f"?api_key={EIA_API_KEY}"
+        )
         r = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
         r.raise_for_status()
         data = r.json()
@@ -344,17 +371,18 @@ def get_eia_storage():
     except Exception as e:
         logger.error(f"Ошибка EIA API: {e}")
         return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
+
+
 def score_storage(storage_bcf, build, forecast):
     """
     Считает скоринг по запасам газа (от -3 до +3) и формирует пояснительное сообщение.
-    Логика: отклонение от 5‑летней средней + сюрприз по закачке относительно прогноза.
+    Логика: отклонение от 5-летней средней + сюрприз по закачке относительно прогноза.
     """
     score = 0
-    avg_5yr = 3000  # упрощённая 5‑летняя средняя (Bcf)
+    avg_5yr = 3000  # упрощённая 5-летняя средняя (Bcf)
     pct = ((storage_bcf - avg_5yr) / avg_5yr) * 100
     msg = f"Текущие: {storage_bcf:.0f} Bcf ({pct:+.1f}% к 5л ср.)\n"
 
-    # Отклонение от нормы по уровню запасов
     if pct > 5:
         score -= 2
         msg += "📈 Запасы выше нормы → давление на цену\n"
@@ -362,7 +390,6 @@ def score_storage(storage_bcf, build, forecast):
         score += 2
         msg += "📉 Запасы ниже нормы → поддержка цены\n"
 
-    # Сюрприз по закачке: фактическая vs прогноз
     if build > 0 and forecast > 0:
         if build > forecast * 1.3:
             score -= 1
@@ -376,16 +403,20 @@ def score_storage(storage_bcf, build, forecast):
     return score, msg
 
 
+# ============================================================
+# МОДУЛЬ 4: НОВОСТИ
+# ============================================================
+
+
 def parse_news():
     """
-    Парсит RSS‑ленты на свежие новости по газу/энергии за последние 6 часов.
-    Таймаут и User‑Agent добавлены, чтобы скрипт не висел.
+    Парсит RSS-ленты на свежие новости по газу/энергии за последние 6 часов.
     Возвращает список заголовков (не более 5 штук).
     """
     feeds = [
         "https://www.naturalgasintelligence.com/feed/",
         "https://www.eia.gov/todayinenergy/rss.xml",
-        "https://oilprice.com/rss/home.rss"
+        "https://oilprice.com/rss/home.rss",
     ]
     titles = []
     cutoff = datetime.now() - timedelta(hours=6)
@@ -395,12 +426,11 @@ def parse_news():
             r = requests.get(
                 feed,
                 timeout=REQUEST_TIMEOUT_SECONDS,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; HenryHubBot/1.0)"}
+                headers={"User-Agent": "Mozilla/5.0 (compatible; HenryHubBot/1.0)"},
             )
             r.raise_for_status()
             root = ET.fromstring(r.content)
 
-            # Пробуем оба типичных пути к item: channel/item и просто item
             items = root.findall(".//item")
             if not items:
                 items = root.findall(".//channel/item")
@@ -412,13 +442,12 @@ def parse_news():
                 if not title:
                     continue
 
-                # Простой парсинг pubDate, если есть; иначе пропускаем проверку времени
                 pub_dt = None
                 if pub_str:
                     for fmt in [
                         "%a, %d %b %Y %H:%M:%S %Z",
                         "%Y-%m-%dT%H:%M:%SZ",
-                        "%Y-%m-%d %H:%M:%S"
+                        "%Y-%m-%d %H:%M:%S",
                     ]:
                         try:
                             pub_dt = datetime.strptime(pub_str, fmt)
@@ -426,7 +455,6 @@ def parse_news():
                         except ValueError:
                             continue
 
-                # Если дату не смогли распарсить — берём первые 2 новости с ленты
                 if pub_dt is None or pub_dt >= cutoff:
                     titles.append(title)
                     if len(titles) >= 5:
@@ -438,11 +466,11 @@ def parse_news():
 
     return titles
 
-import time
-import logging
-import requests
 
-logger = logging.getLogger(__name__)
+# ============================================================
+# МОДУЛЬ 5: TELEGRAM
+# ============================================================
+
 
 def send_telegram(message, max_retries=3):
     """Отправляет сообщение в Telegram с обработкой 429."""
@@ -454,7 +482,7 @@ def send_telegram(message, max_retries=3):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown"
+        "parse_mode": "Markdown",
     }
 
     for attempt in range(max_retries):
@@ -468,21 +496,27 @@ def send_telegram(message, max_retries=3):
             if r.status_code == 429:
                 data = r.json()
                 retry_after = data.get("parameters", {}).get("retry_after", 60)
-                logger.warning(f"Telegram 429. Ждём {retry_after} сек (попытка {attempt+1}/{max_retries})...")
+                logger.warning(
+                    f"Telegram 429. Ждём {retry_after} сек (попытка {attempt + 1}/{max_retries})..."
+                )
                 time.sleep(retry_after)
                 continue
 
-            logger.error(f"Telegram API error: статус {r.status_code}, ответ: {r.text[:200]}")
+            logger.error(
+                f"Telegram API error: статус {r.status_code}, ответ: {r.text[:200]}"
+            )
             return
 
         except Exception as e:
-            logger.error(f"Failed to send Telegram message (попытка {attempt+1}): {e}")
+            logger.error(f"Failed to send Telegram message (попытка {attempt + 1}): {e}")
             if attempt == max_retries - 1:
                 return
             time.sleep(5)
 
 
-
+# ============================================================
+# МОДУЛЬ 6: MAIN
+# ============================================================
 
 
 def main():
@@ -493,7 +527,9 @@ def main():
         df = fetch_prices()
         if df.empty:
             logger.critical("Не удалось загрузить цены (пустой DataFrame).")
-            send_telegram("❌ Henry Hub: ошибка загрузки цен\nYahoo вернул пустые данные или 429.")
+            send_telegram(
+                "❌ Henry Hub: ошибка загрузки цен\nYahoo вернул пустые данные или 429."
+            )
             return
         logger.info(f"Loaded {len(df)} price bars")
     except Exception as e:
@@ -501,10 +537,11 @@ def main():
         send_telegram(f"❌ Henry Hub: ошибка загрузки цен\n{e}")
         return
 
-
     # 2. Индикаторы
     ind = calc_indicators(df)
-    logger.info(f"Indicators calculated: RSI={ind['rsi']:.2f}, Price=${ind['price']:.3f}")
+    logger.info(
+        f"Indicators calculated: RSI={ind['rsi']:.2f}, Price=${ind['price']:.3f}"
+    )
 
     # 3. Уровни
     support_lvls, resistance_lvls = find_swing_levels(df)
@@ -521,7 +558,11 @@ def main():
 
     # 5. Новости
     news_titles = parse_news()
-    news_msg = "📰 Новости (последние 6 ч):\n" + "\n".join([f"• {t}" for t in news_titles]) if news_titles else "📰 Новостей за 6 часов нет"
+    news_msg = (
+        "📰 Новости (последние 6 ч):\n" + "\n".join([f"• {t}" for t in news_titles])
+        if news_titles
+        else "📰 Новостей за 6 часов нет"
+    )
 
     # 6. Итоговый скоринг и сообщение
     total_score = level_score + storage_score
@@ -530,7 +571,7 @@ def main():
     report = (
         f"{score_emoji} **Henry Hub Signals** (Score: {total_score})\n\n"
         f"💵 Цена: ${ind['price']:.3f}\n"
-        f"📈 RSI-14: {ind['rsi']:.2f} | MA50: {ind['ma50']:.3f} | MA200: {ind['ma200']:.3f}\n\n"
+        f"📈 RSI-14: {ind['rsi']:.2f} | MA50: ${ind['ma50']:.3f} | MA200: ${ind['ma200']:.3f}\n\n"
         f"{levels_msg}\n"
         f"{storage_msg}\n"
         f"{news_msg}"
@@ -540,36 +581,6 @@ def main():
     send_telegram(report)
     logger.info("=== END HENRY HUB SIGNALS ===")
 
-# ВСТАВЬ ЭТО В КОНЕЦ ФАЙЛА, ПЕРЕД if __name__ == "__main__":
-import os
-import requests
-
-def test_telegram():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    
-    if not token or not chat_id:
-        print("❌ ОШИБКА: Не найдены переменные TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID!")
-        return
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": "✅ Проверка: GitHub Actions может писать в Telegram!",
-        "parse_mode": "Markdown"
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        data = resp.json()
-        if data.get("ok"):
-            print("✅ ТЕСТ УСПЕШЕН: Сообщение отправлено!")
-        else:
-            print(f"❌ ТЕСТ НЕ ПРОЙДЕН: {data}")
-    except Exception as e:
-        print(f"❌ ТЕСТ НЕ ПРОЙДЕН (ошибка сети): {e}")
-
-# Запускаем тест сразу при старте
-test_telegram()
 
 if __name__ == "__main__":
     main()
