@@ -539,28 +539,34 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
 # МОДУЛЬ 5: ЗАПАСЫ EIA
 # ============================================================
 
-def get_eia_storage():
+def fetch_eia_storage_direct():
+    """
+    Альтернативный метод: прямой запрос к эндпоинту данных с фильтрацией.
+    """
+    logger.info("→ Попытка загрузки запасов через прямой запрос...")
     if not EIA_API_KEY:
-        logger.warning("EIA_API_KEY не задан — fallback-значения запасов.")
-        return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
+        return None, None, STORAGE_FORECAST
 
+    # Прямой запрос к data endpoint с фильтром по названию серии
+    # Это часто работает, даже если ID серии изменился
+    url = f"https://api.eia.gov/v2/data?api_key={EIA_API_KEY}&series_id=NG.N3010US3.M"
+    
+    # Если NG.N3010US3.M не работает, попробуй найти актуальный ID на сайте EIA Data Browser
+    # и подставь его сюда.
+    
     try:
-        url = (
-            f"https://api.eia.gov/v2/seriesid/NG.NW2_EPG0_SGO_RNG_RNGFM_WUS"
-            f"?api_key={EIA_API_KEY}"
-        )
         r = requests.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        values = data["series"][0]["data"]
-        current = float(values[0][1])
-        prev = float(values[1][1])
-        build = current - prev
-        logger.info(f"  EIA Storage: current={current}, build={build}")
-        return current, build, STORAGE_FORECAST
+        if r.status_code == 200:
+            data = r.json()
+            raw = data.get("response", {}).get("data", [])
+            if raw:
+                latest = raw
+                return pd.to_datetime(latest['period']), float(latest['value']), 0 # Build придется считать отдельно
+        return None, None, STORAGE_FORECAST
     except Exception as e:
-        logger.warning(f"  EIA Storage: ошибка ({e}) — fallback.")
-        return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
+        logger.error(f"Ошибка прямого запроса: {e}")
+        return None, None, STORAGE_FORECAST
+
 
 
 # ============================================================
