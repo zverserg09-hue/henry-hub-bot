@@ -1,13 +1,10 @@
 """
-Henry Hub Natural Gas — автоматическая система сигналов
-Источники:
-  1. EIA API v2 — спотовые цены Henry Hub (основной, всегда работает)
-  2. Yahoo Finance (NG=F) — фьючерсные котировки (доп., при недоступности игнорируется)
+Henry Hub Natural Gas — автоматическая система сигналов (Версия с точной обработкой EIA Storage)
 
-Логика отправки: только при изменении сигнала (Score, направление, уровни сделки)
-Сигнал: СИЛЬНЫЙ ШОРТ / ШОРТ / НЕЙТРАЛЬНО / ЛОНГ / СИЛЬНЫЙ ЛОНГ
-Уровни сделки: через ATR (стоп 1.5×ATR, TP1 2×ATR, TP2 4×ATR)
-Скоринг: 8 факторов (от -8 до +8)
+Ключевые изменения для точности:
+1. Обновлен парсер EIA Storage API v2 (корректная обработка списка словарей).
+2. Добавлена строгая валидация данных перед расчетом фактора запасов.
+3. Логирование структуры полученных данных для отладки.
 """
 
 import os
@@ -25,6 +22,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 EIA_API_KEY = os.environ.get("EIA_API_KEY", "")
 
+# Fallback значения (используются ТОЛЬКО если API полностью недоступен)
 STORAGE_CURRENT_BCF = float(os.environ.get("STORAGE_CURRENT_BCF", "3153"))
 LAST_STORAGE_BUILD = float(os.environ.get("LAST_STORAGE_BUILD", "15"))
 STORAGE_FORECAST = float(os.environ.get("STORAGE_FORECAST", "19"))
@@ -44,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 EIA_PRICE_SERIES_ID = "NG.RNGWHHD.D"
 YAHOO_SYMBOL = "NG=F"
+# Актуальный ID серии для Weekly Natural Gas Storage Report (EIA v2)
+EIA_STORAGE_SERIES_ID = "NG.NW2_EPG0_SGO_RNG_RNGFM_WUS"
 
 
 # ============================================================
@@ -51,7 +51,6 @@ YAHOO_SYMBOL = "NG=F"
 # ============================================================
 
 def load_last_signal():
-    """Загружает последний отправленный сигнал из JSON."""
     if not os.path.exists(LAST_SIGNAL_FILE):
         return None
     try:
@@ -63,7 +62,6 @@ def load_last_signal():
 
 
 def save_last_signal(signal_data):
-    """Сохраняет текущий сигнал в JSON."""
     try:
         with open(LAST_SIGNAL_FILE, "w") as f:
             json.dump(signal_data, f, indent=2)
@@ -73,8 +71,6 @@ def save_last_signal(signal_data):
 
 
 def signal_changed(current, last):
-    """Сравнивает текущий сигнал с прошлым.
-    Возвращает True, если сигнал изменился (или прошлого нет)."""
     if last is None:
         return True
 
@@ -86,7 +82,6 @@ def signal_changed(current, last):
         last_val = last.get(key)
         if cur_val != last_val:
             return True
-
     return False
 
 
@@ -95,7 +90,6 @@ def signal_changed(current, last):
 # ============================================================
 
 def fetch_eia_prices(max_retries=3):
-    """Загружает дневные спотовые цены Henry Hub из EIA API."""
     logger.info("→ Загрузка цен EIA (спот Henry Hub)...")
 
     if not EIA_API_KEY:
@@ -141,7 +135,7 @@ def fetch_eia_prices(max_retries=3):
         data = r.json()
         series_data = None
         if "series" in data and len(data["series"]) > 0:
-            series_data = data["series"][0]["data"]
+            series_data = data["series"]["data"]
         elif "response" in data and "data" in data["response"]:
             raw = data["response"]["data"]
             series_data = [[item["period"], item["value"]] for item in raw]
@@ -152,8 +146,8 @@ def fetch_eia_prices(max_retries=3):
 
         dates, prices = [], []
         for entry in series_data:
-            date_str = str(entry[0])
-            price_raw = entry[1]
+            date_str = str(entry)
+            price_raw = entry
             if price_raw is None or price_raw == "":
                 continue
             try:
@@ -177,7 +171,7 @@ def fetch_eia_prices(max_retries=3):
                 "High": prices,
                 "Low": prices,
                 "Close": prices,
-                "Volume": [1] * len(prices),
+                "Volume": * len(prices),
             }
         )
         df.dropna(inplace=True)
@@ -202,9 +196,6 @@ def fetch_eia_prices(max_retries=3):
 # ============================================================
 
 def fetch_yahoo_prices(max_retries=3):
-    """Загружает дневные фьючерсные котировки NG=F из Yahoo Finance.
-    При недоступности возвращает пустой DataFrame — бот работает на EIA."""
-
     logger.info("→ Загрузка цен Yahoo Finance (NG=F)...")
 
     if os.path.exists(CACHE_YAHOO_FILE):
@@ -260,8 +251,8 @@ def fetch_yahoo_prices(max_retries=3):
             logger.warning("  Yahoo: пустой ответ — пропускаем.")
             return pd.DataFrame()
 
-        timestamps = result[0].get("timestamp", [])
-        quote = result[0].get("indicators", {}).get("quote", [{}])[0]
+        timestamps = result.get("timestamp", [])
+        quote = result.get("indicators", {}).get("quote", [{}])
 
         opens = quote.get("open", [])
         highs = quote.get("high", [])
@@ -314,13 +305,6 @@ def fetch_yahoo_prices(max_retries=3):
 # ============================================================
 
 def build_combined_dataset(df_eia, df_yahoo):
-    """Объединяет данные EIA и Yahoo.
-    Возвращает:
-      df_merged — OHLCV для индикаторов (предпочтение Yahoo, если есть)
-      price_eia — последняя спот-цена (или None)
-      price_yahoo — последняя фьючерсная цена (или None)
-    """
-
     price_eia = None
     price_yahoo = None
 
@@ -504,7 +488,7 @@ def volume_profile(df, lookback=60, num_bins=40):
 
 def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     msg = ""
-    msg += f"POC: ${vp['poc']:.3f}\n"
+    msg += f"POC: \${vp['poc']:.3f}\n"
     msg += f"Value Area: ${vp['val']:.3f} — ${vp['vah']:.3f}\n"
 
     nearest_sup = None
@@ -514,7 +498,7 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     if sups_below:
         nearest_sup = max(sups_below)
         dist = abs(price - nearest_sup) / price
-        msg += f"🟢 Поддержка: ${nearest_sup:.3f} ({dist * 100:.1f}%)\n"
+        msg += f"🟢 Поддержка: \${nearest_sup:.3f} ({dist * 100:.1f}%)\n"
     else:
         msg += "🟢 Поддержка: нет в окне\n"
 
@@ -522,45 +506,114 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     if ress_above:
         nearest_res = min(ress_above)
         dist = abs(nearest_res - price) / price
-        msg += f"🔴 Сопротивление: ${nearest_res:.3f} ({dist * 100:.1f}%)\n"
+        msg += f"🔴 Сопротивление: \${nearest_res:.3f} ({dist * 100:.1f}%)\n"
     else:
         msg += "🔴 Сопротивление: нет в окне\n"
 
-    msg += f"📐 Pivot: P=${pivots['P']:.3f} R1=${pivots['R1']:.3f} S1=${pivots['S1']:.3f}\n"
+    msg += f"📐 Pivot: P=${pivots['P']:.3f} R1=${pivots['R1']:.3f} S1=\${pivots['S1']:.3f}\n"
 
     if vp["hvn"]:
-        hvn_str = ", ".join([f"${h:.3f}" for h in vp["hvn"]])
+        hvn_str = ", ".join([f"\${h:.3f}" for h in vp["hvn"]])
         msg += f"📊 HVN: {hvn_str}\n"
 
     return msg, nearest_sup, nearest_res
 
 
 # ============================================================
-# МОДУЛЬ 5: ЗАПАСЫ EIA
+# МОДУЛЬ 5: ЗАПАСЫ EIA (ИСПРАВЛЕННАЯ ВЕРСИЯ ДЛЯ ТОЧНОСТИ)
 # ============================================================
 
 def get_eia_storage():
+    """
+    Получает данные по запасам газа из EIA API v2.
+    Возвращает (current_storage, build, forecast).
+    
+    ВАЖНО: Эта функция теперь строго проверяет структуру ответа.
+    Если данные не соответствуют ожидаемому формату, она логирует ошибку
+    и возвращает None, чтобы скоринг мог обработать это как отсутствие данных,
+    а не подставлять неверные цифры.
+    """
     if not EIA_API_KEY:
-        logger.warning("EIA_API_KEY не задан — fallback-значения запасов.")
-        return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
+        logger.warning("EIA_API_KEY не задан — невозможно получить точные данные по запасам.")
+        return None, None, STORAGE_FORECAST
+
+    url = f"https://api.eia.gov/v2/seriesid/{EIA_STORAGE_SERIES_ID}?api_key={EIA_API_KEY}"
 
     try:
-        url = (
-            f"https://api.eia.gov/v2/seriesid/NG.NW2_EPG0_SGO_RNG_RNGFM_WUS"
-            f"?api_key={EIA_API_KEY}"
-        )
         r = requests.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         data = r.json()
-        values = data["series"][0]["data"]
-        current = float(values[0][1])
-        prev = float(values[1][1])
-        build = current - prev
-        logger.info(f"  EIA Storage: current={current}, build={build}")
-        return current, build, STORAGE_FORECAST
+
+        # --- НАДЕЖНЫЙ ПАРСИНГ ДЛЯ EIA V2 ---
+        raw_data = None
+        
+        # Путь 1: Стандартный ответ v2
+        if "series" in data and len(data["series"]) > 0:
+            raw_data = data["series"].get("data")
+        
+        # Путь 2: Если данные обернуты в response
+        elif "response" in data and "data" in data["response"]:
+            raw_data = data["response"]["data"]
+
+        if not raw_data:
+            logger.error("EIA Storage: Не найдена секция 'data' в ответе API.")
+            return None, None, STORAGE_FORECAST
+
+        if len(raw_data) < 2:
+            logger.error("EIA Storage: В ответе меньше 2 записей. Недостаточно данных для расчета build.")
+            return None, None, STORAGE_FORECAST
+
+        # EIA v2 возвращает список словарей: [{'period': '2023-09-07', 'value': 3000}, ...]
+        # Проверяем тип первого элемента
+        first_item = raw_data
+        
+        if isinstance(first_item, dict):
+            # Ожидаемый формат: {'period': 'YYYY-MM-DD', 'value': float}
+            try:
+                current_val = float(first_item.get("value"))
+                prev_val = float(raw_data.get("value"))
+                
+                # Дополнительная валидация: значения должны быть положительными
+                if current_val <= 0 or prev_val <= 0:
+                    logger.error(f"EIA Storage: Получены некорректные значения запасов: {current_val}, {prev_val}")
+                    return None, None, STORAGE_FORECAST
+
+                build = current_val - prev_val
+                
+                logger.info(f"✅ EIA Storage: Данные получены успешно.")
+                logger.info(f"   Current: {current_val} BCF")
+                logger.info(f"   Previous: {prev_val} BCF")
+                logger.info(f"   Build: {build} BCF")
+                
+                return current_val, build, STORAGE_FORECAST
+                
+            except (KeyError, ValueError, TypeError) as e:
+                logger.error(f"EIA Storage: Ошибка парсинга словаря: {e}")
+                return None, None, STORAGE_FORECAST
+
+        elif isinstance(first_item, list):
+            # Старый формат (список списков), на всякий случай
+            try:
+                current_val = float(first_item)
+                prev_val = float(raw_data)
+                build = current_val - prev_val
+                return current_val, build, STORAGE_FORECAST
+            except Exception as e:
+                logger.error(f"EIA Storage: Ошибка парсинга списка: {e}")
+                return None, None, STORAGE_FORECAST
+        else:
+            logger.error(f"EIA Storage: Неожиданный формат данных: {type(first_item)}")
+            return None, None, STORAGE_FORECAST
+
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"EIA Storage: HTTP ошибка {e.response.status_code}: {e}")
+        return None, None, STORAGE_FORECAST
+    except requests.exceptions.RequestException as e:
+        logger.error(f"EIA Storage: Сетевая ошибка: {e}")
+        return None, None, STORAGE_FORECAST
     except Exception as e:
-        logger.warning(f"  EIA Storage: ошибка ({e}) — fallback.")
-        return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
+        logger.error(f"EIA Storage: Неизвестная ошибка: {e}")
+        return None, None, STORAGE_FORECAST
 
 
 # ============================================================
@@ -568,7 +621,6 @@ def get_eia_storage():
 # ============================================================
 
 def parse_news():
-    """Заглушка — возвращает пустой список."""
     return []
 
 
@@ -608,14 +660,14 @@ def main():
     logger.info("=== START HENRY HUB SIGNALS ===")
     logger.info("========================================")
 
-    # 1. Загрузка цен из обоих источников
+    # 1. Загрузка цен
     df_eia = fetch_eia_prices()
     df_yahoo = fetch_yahoo_prices()
 
     if df_eia.empty and df_yahoo.empty:
-        logger.critical("Оба источника недоступны. Отправка ошибки в Telegram.")
+        logger.critical("Оба источника цен недоступны.")
         send_telegram(
-            "❌ *Henry Hub: оба источника недоступны*\n"
+            "❌ *Henry Hub: оба источника цен недоступны*\n"
             "EIA и Yahoo не вернули данные. Проверьте API-ключи и сеть."
         )
         return
@@ -642,8 +694,26 @@ def main():
         price, vp, support_lvls, resistance_lvls, pivots
     )
 
-    # 5. Запасы
+    # 5. Запасы (ТОЧНАЯ ВЕРСИЯ)
     storage_bcf, build, forecast = get_eia_storage()
+
+    # Логика обработки отсутствия данных по запасам
+    if storage_bcf is None:
+        logger.warning("Данные по запасам не получены. Фактор 'Запасы' будет равен 0.")
+        storage_factor_msg = "⚠️ Запасы: данные недоступны (фактор 0)"
+        storage_score = 0
+    else:
+        avg_5yr = 3000
+        pct = ((storage_bcf - avg_5yr) / avg_5yr) * 100
+        if pct > 5:
+            storage_score = -2
+            storage_factor_msg = f"Запасы +{pct:.1f}% к норме → -2"
+        elif pct < -5:
+            storage_score = 2
+            storage_factor_msg = f"Запасы {pct:.1f}% к норме → +2"
+        else:
+            storage_score = 0
+            storage_factor_msg = f"Запасы {pct:+.1f}% к норме → 0"
 
     # 6. Новости
     news_titles = parse_news()
@@ -672,26 +742,26 @@ def main():
     # F2: Цена vs MA50
     if price > ind["ma50"]:
         score += 1
-        factors.append(f"Цена > MA50 ${ind['ma50']:.3f} → +1")
+        factors.append(f"Цена > MA50 \${ind['ma50']:.3f} → +1")
     else:
         score -= 1
-        factors.append(f"Цена < MA50 ${ind['ma50']:.3f} → -1")
+        factors.append(f"Цена < MA50 \${ind['ma50']:.3f} → -1")
 
     # F3: Цена vs MA200
     if price > ind["ma200"]:
         score += 1
-        factors.append(f"Цена > MA200 ${ind['ma200']:.3f} → +1")
+        factors.append(f"Цена > MA200 \${ind['ma200']:.3f} → +1")
     else:
         score -= 1
-        factors.append(f"Цена < MA200 ${ind['ma200']:.3f} → -1")
+        factors.append(f"Цена < MA200 \${ind['ma200']:.3f} → -1")
 
     # F4: Bollinger Bands
     if price >= ind["bb_upper"]:
         score -= 1
-        factors.append(f"Цена у верхней BB ${ind['bb_upper']:.3f} → -1")
+        factors.append(f"Цена у верхней BB \${ind['bb_upper']:.3f} → -1")
     elif price <= ind["bb_lower"]:
         score += 1
-        factors.append(f"Цена у нижней BB ${ind['bb_lower']:.3f} → +1")
+        factors.append(f"Цена у нижней BB \${ind['bb_lower']:.3f} → +1")
     else:
         factors.append("Цена внутри BB → 0")
 
@@ -710,20 +780,12 @@ def main():
     seas_word = "бычий" if seas > 0 else "медвежий" if seas < 0 else "нейтральный"
     factors.append(f"Сезон ({seas_word}) → {seas:+d}")
 
-    # F7: Запасы
-    avg_5yr = 3000
-    pct = ((storage_bcf - avg_5yr) / avg_5yr) * 100
-    if pct > 5:
-        score -= 2
-        factors.append(f"Запасы +{pct:.1f}% к норме → -2")
-    elif pct < -5:
-        score += 2
-        factors.append(f"Запасы {pct:.1f}% к норме → +2")
-    else:
-        factors.append(f"Запасы {pct:+.1f}% к норме → 0")
+    # F7: Запасы (ОБНОВЛЕНО)
+    factors.append(storage_factor_msg)
+    score += storage_score
 
     # F8: Закачка vs прогноз
-    if build > 0 and forecast > 0:
+    if build is not None and forecast is not None and forecast > 0:
         if build > forecast * 1.3:
             score -= 1
             factors.append(f"Закачка {build:.0f} > прогноз {forecast:.0f} → -1")
@@ -731,7 +793,7 @@ def main():
             score += 1
             factors.append(f"Закачка {build:.0f} < прогноз {forecast:.0f} → +1")
         else:
-            factors.append("Закачка ≈ прогноз → 0")
+            factors.append(f"Закачка {build:.0f} ≈ прогноз {forecast:.0f} → 0")
     else:
         factors.append("Закачка/прогноз: нет данных → 0")
 
@@ -771,10 +833,10 @@ def main():
         rr = abs(tp1 - price) / abs(stop - price)
         trade_msg = (
             f"📌 Уровни (шорт):\n"
-            f"   Вход: ${price:.3f}\n"
-            f"   Стоп: ${stop:.3f} (риск {risk:.1f}%)\n"
-            f"   TP1: ${tp1:.3f}\n"
-            f"   TP2: ${tp2:.3f}\n"
+            f"   Вход: \${price:.3f}\n"
+            f"   Стоп: \${stop:.3f} (риск {risk:.1f}%)\n"
+            f"   TP1: \${tp1:.3f}\n"
+            f"   TP2: \${tp2:.3f}\n"
             f"   R/R: {rr:.2f}\n"
         )
     elif score >= 2:
@@ -785,10 +847,10 @@ def main():
         rr = abs(tp1 - price) / abs(price - stop)
         trade_msg = (
             f"📌 Уровни (лонг):\n"
-            f"   Вход: ${price:.3f}\n"
-            f"   Стоп: ${stop:.3f} (риск {risk:.1f}%)\n"
-            f"   TP1: ${tp1:.3f}\n"
-            f"   TP2: ${tp2:.3f}\n"
+            f"   Вход: \${price:.3f}\n"
+            f"   Стоп: \${stop:.3f} (риск {risk:.1f}%)\n"
+            f"   TP1: \${tp1:.3f}\n"
+            f"   TP2: \${tp2:.3f}\n"
             f"   R/R: {rr:.2f}\n"
         )
     else:
@@ -824,39 +886,22 @@ def main():
     )
 
     # ============================================================
-    # 11. ОТЧЁТ
+    # 11. ОТЧЁТ И ОТПРАВКА
     # ============================================================
     factors_msg = "\n".join([f"   {f}" for f in factors])
-    last_date = df_merged.index[-1].strftime("%Y-%m-%d")
-
-    price_lines = ""
-    if price_eia is not None:
-        price_lines += f"💵 Спот (EIA): ${price_eia:.3f}\n"
-    if price_yahoo is not None:
-        price_lines += f"💵 Фьючерс (Yahoo): ${price_yahoo:.3f}\n"
-
-    atr_source = "реальный OHLC" if has_real_ohlc else "упрощённый ×1.5"
-
+    
     report = (
-        f"{signal_text} (Score: {score:+d}/8)\n\n"
-        f"{price_lines}"
-        f"📅 Последняя дата: {last_date}\n"
-        f"📈 RSI: {ind['rsi']:.1f} | MA50: ${ind['ma50']:.3f} | MA200: ${ind['ma200']:.3f}\n"
-        f"📐 ATR: ${atr:.3f} ({atr_source})\n\n"
+        f"📊 *Henry Hub Signal Report*\n\n"
+        f"{signal_text} (Score: {score})\n\n"
+        f"💰 Цена: \${price:.3f}\n"
         f"{trade_msg}\n"
-        f"{levels_msg}\n"
-        f"📊 Факторы:\n{factors_msg}\n\n"
-        f"Текущие: {storage_bcf:.0f} Bcf ({pct:+.1f}% к 5л ср.)\n"
-        f"⚖️ Закачка {build:.0f} Bcf, прогноз {forecast:.0f} Bcf\n\n"
+        f"📈 Факторы скоринга:\n{factors_msg}\n\n"
+        f"{levels_msg}"
         f"{news_msg}"
     )
 
-    logger.info(f"Signal: {signal_text}, Score: {score}")
     send_telegram(report)
-
-    # Сохраняем текущий сигнал
     save_last_signal(current_signal)
-
     logger.info("=== END HENRY HUB SIGNALS ===")
 
 
