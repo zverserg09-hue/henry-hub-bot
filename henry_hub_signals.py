@@ -601,7 +601,7 @@ def main():
     support_lvls, resistance_lvls = find_swing_levels(df)
     pivots = calc_pivots(df)
     vp = volume_profile(df)
-    levels_msg, nearest_sup, nearest_res = format_levels_message(
+    levels_msg, nearest_sup, nearest_res, *_ = format_levels_message(
         ind["price"], vp, support_lvls, resistance_lvls, pivots
     )
 
