@@ -1,0 +1,37 @@
+{
+  "feature_cols": [
+    "rsi",
+    "dist_ma50",
+    "dist_ma200",
+    "bb_pos",
+    "bb_width",
+    "macd_hist",
+    "atr_norm",
+    "month_sin",
+    "month_cos",
+    "dow_sin",
+    "dow_cos",
+    "rel_volume",
+    "roc_1",
+    "roc_3",
+    "roc_5",
+    "roc_10",
+    "ret_1",
+    "ret_2",
+    "ret_3",
+    "ret_5",
+    "poc_dist",
+    "rsi_slope"
+  ],
+  "horizon": 5,
+  "threshold_atr": 0.5,
+  "classes": {
+    "0": "down",
+    "1": "neutral",
+    "2": "up"
+  },
+  "backtest_accuracy": 0.5619999999999999,
+  "backtest_f1": 0.5632085952234235,
+  "train_date": "2026-09-06T17:07:20.628447",
+  "train_samples": 1054
+}
