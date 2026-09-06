@@ -29,7 +29,7 @@ STORAGE_FORECAST    = float(os.environ.get("STORAGE_FORECAST", "19"))
 SYMBOL = "NG=F"
 LOG_FILE = "henry_hub_signals.log"
 
-CME_START_HOUR_MSK = 16
+CME_START_HOUR_MSK = 9
 CME_END_HOUR_MSK   = 23
 
 REGULAR_INTERVAL_HOURS = 4
