@@ -7,12 +7,15 @@ Henry Hub Natural Gas — автоматическая система сигна
 
 import os
 import re
+import sys
 import time
 import json
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
+
 import requests
 import pandas as pd
 import numpy as np
@@ -28,20 +31,22 @@ STORAGE_FORECAST    = float(os.environ.get("STORAGE_FORECAST", "19"))
 
 SYMBOL = "NG=F"
 LOG_FILE = "henry_hub_signals.log"
+LAST_SIGNAL_FILE = "last_signal.json"
 
+MSK = ZoneInfo("Europe/Moscow")
+
+# Часы активных торгов (по МСК)
 CME_START_HOUR_MSK = 9
 CME_END_HOUR_MSK   = 23
 
 REGULAR_INTERVAL_HOURS = 4
-SCORE_CHANGE_THRESHOLD  = 3   # если score изменился на эту величину — отправить даже без смены сигнала
+SCORE_CHANGE_THRESHOLD  = 3
 
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
     format="%(asctime)s | %(message)s",
 )
-
-LAST_SIGNAL_FILE = "last_signal.json"
 
 # ============================================================
 # МОДУЛЬ 1: ЦЕНОВЫЕ ДАННЫЕ — Yahoo + EIA
@@ -92,7 +97,7 @@ def fetch_prices_eia():
             "facets[series][]": "RNGWHHD",
             "sort[0][column]": "period",
             "sort[0][direction]": "desc",
-            "length": 730,  # ~2 года
+            "length": 730,
         }
         r = requests.get(url, params=params, timeout=15)
         r.raise_for_status()
@@ -121,37 +126,43 @@ def fetch_prices_eia():
 
 
 def fetch_prices():
-    """Объединяет данные Yahoo (фьючерс) и EIA (спот). Возвращает основной DataFrame."""
+    """Объединяет данные Yahoo (фьючерс) и EIA (спот). Возвращает DataFrame и метку источника."""
     df_yahoo = fetch_prices_yahoo()
     df_eia   = fetch_prices_eia()
 
+    source_label = ""
+    primary = None
+
     if df_yahoo is not None and len(df_yahoo) >= 50:
         primary = df_yahoo.copy()
-        source_label = "Yahoo (NG=F фьючерс)"
+        source_label = "Yahoo Finance (NG=F фьючерс)"
+        logging.info(f"[ИСТОЧНИКИ] Загружено {len(df_yahoo)} свечей из Yahoo Finance")
     elif df_eia is not None and len(df_eia) >= 50:
         primary = df_eia.copy()
         source_label = "EIA (Henry Hub спот)"
+        logging.info(f"[ИСТОЧНИКИ] Загружено {len(df_eia)} цен из EIA API")
     else:
+        logging.error("[ИСТОЧНИКИ] Не удалось получить данные ни из Yahoo, ни из EIA")
         raise RuntimeError("Не удалось получить достаточно данных ни из Yahoo, ни из EIA")
 
-    # Если есть оба источника — добавляем колонку со спот-ценой EIA для справки
-    if df_yahoo is not None and df_eia is not None:
+    # Добавляем справочную колонку со спот-ценой EIA
+    if df_eia is not None:
         eia_close = df_eia["Close"].rename("EIA_Spot")
         primary = primary.join(eia_close, how="left")
-    elif df_eia is not None:
-        primary["EIA_Spot"] = primary["Close"]
+        logging.info("[ИСТОЧНИКИ] Данные EIA добавлены как справочная колонка EIA_Spot")
     else:
         primary["EIA_Spot"] = np.nan
+        logging.warning("[ИСТОЧНИКИ] Данные EIA недоступны — колонка EIA_Spot заполнена NaN")
 
-    logging.info(f"Источник цен: {source_label}")
-    return primary
-
+    logging.info(f"[ИСТОЧНИКИ] Финальный источник цен: {source_label}")
+    return primary, source_label
 
 # ============================================================
 # МОДУЛЬ 2: ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ
 # ============================================================
 
 def calc_indicators(df):
+    """Считаем RSI-14, MA50, MA200, Bollinger Bands, MACD, ATR-14."""
     close = df["Close"]
 
     # RSI-14
@@ -164,20 +175,24 @@ def calc_indicators(df):
     if np.isnan(rsi):
         rsi = 50.0
 
+    # MA
     ma50  = close.rolling(50).mean().iloc[-1]
     ma200 = close.rolling(200).mean().iloc[-1]
 
+    # Bollinger Bands
     bb_mid = close.rolling(20).mean()
     bb_std = close.rolling(20).std()
     bb_upper = (bb_mid + 2 * bb_std).iloc[-1]
     bb_lower = (bb_mid - 2 * bb_std).iloc[-1]
 
+    # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     signal_line = macd.ewm(span=9, adjust=False).mean()
     macd_hist = (macd - signal_line).iloc[-1]
 
+    # ATR-14
     high, low = df["High"], df["Low"]
     tr = np.maximum(
         np.maximum(high - low, np.abs(high - close.shift(1))),
@@ -197,6 +212,7 @@ def calc_indicators(df):
     }
 
 def seasonality_score(month):
+    """Историческая сезонность Henry Hub по месяцам."""
     scores = {
         1: 3, 2: 2, 3: 1, 4: -1, 5: -2, 6: -1,
         7: 0, 8: -1, 9: -2, 10: -1, 11: 2, 12: 3,
@@ -208,6 +224,7 @@ def seasonality_score(month):
 # ============================================================
 
 def find_swing_levels(df, swing_bars=6):
+    """Поиск swing-хаймов и лоуов за последние 120 дней."""
     data = df.tail(120)
     highs = data["High"].values
     lows = data["Low"].values
@@ -226,6 +243,7 @@ def find_swing_levels(df, swing_bars=6):
     return sup_vals, res_vals
 
 def calc_pivots(df):
+    """Классические pivot points по последней свече."""
     last = df.iloc[-1]
     h, l, c = last["High"], last["Low"], last["Close"]
     p = (h + l + c) / 3
@@ -242,6 +260,7 @@ def calc_pivots(df):
 # ============================================================
 
 def volume_profile(df, lookback=60, num_bins=40):
+    """Горизонтальные объёмы: POC, Value Area (VAH/VAL), HVN."""
     data = df.tail(lookback)
     if len(data) == 0:
         return {"poc": 0, "val": 0, "vah": 0, "hvn": []}
@@ -298,6 +317,7 @@ def volume_profile(df, lookback=60, num_bins=40):
     return {"poc": poc, "val": val, "vah": vah, "hvn": hvn}
 
 def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
+    """Форматирует текст уровней и считает скоринг по уровням (от -3 до +3)."""
     level_score = 0
     msg = ""
 
@@ -349,6 +369,7 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
 # ============================================================
 
 def get_eia_storage():
+    """Автозагрузка запасов из EIA API v2 или ручной fallback."""
     if not EIA_API_KEY:
         return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
 
@@ -377,6 +398,7 @@ def get_eia_storage():
         return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
 
 def score_storage(storage_bcf, build, forecast):
+    """Скоринг по запасам: от -3 до +3."""
     score = 0
     msg = ""
 
@@ -444,6 +466,7 @@ NEWS_KEYWORDS = {
 }
 
 def parse_news():
+    """Парсит RSS-ленты, возвращает список заголовков за последние 24 часа."""
     feeds = [
         "https://www.naturalgasintelligence.com/feed/",
         "https://www.eia.gov/todayinenergy/rss.xml",
@@ -475,6 +498,7 @@ def parse_news():
     return titles
 
 def score_news(titles):
+    """Скоринг новостей по ключевым словам. Возвращает (score, message)."""
     category_scores = {}
     category_msgs = {}
     top_headlines = []
@@ -526,6 +550,7 @@ def score_news(titles):
 # ============================================================
 
 def fetch_powerburn():
+    """Парсит данные powerburn с celsiusenergy.net."""
     try:
         url = "https://www.celsiusenergy.net/p/powerburn.html"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -573,9 +598,11 @@ def fetch_powerburn():
         }
 
 def score_powerburn(pb):
+    """Скоринг по powerburn: от -3 до +3."""
     score = 0
     msg = ""
 
+    # Если парсинг не удался — явно сообщаем
     if pb["realtime_bcf"] == 0 and pb["daily_bcf"] == 0:
         msg += "⚠️ Данные недоступны (парсинг не удался)\n"
         return 0, msg
@@ -621,6 +648,7 @@ def score_powerburn(pb):
 
 def calculate_score(ind, level_score, storage_score, season_score,
                    news_score, pb_score):
+    """Суммарный скоринг: техника + уровни + запасы + сезонность + новости + powerburn."""
     score = 0
     price = ind["price"]
     rsi = ind["rsi"]
@@ -628,6 +656,7 @@ def calculate_score(ind, level_score, storage_score, season_score,
     bb_upper = ind["bb_upper"]
     macd_hist = ind["macd_hist"]
 
+    # 1. RSI
     if rsi > 70:
         score -= 2
     elif rsi < 30:
@@ -637,30 +666,43 @@ def calculate_score(ind, level_score, storage_score, season_score,
     elif rsi < 40:
         score += 1
 
+    # 2. Цена vs MA200
     if price < ma200:
         score -= 1
     elif price > ma200:
         score += 1
 
+    # 3. Bollinger
     if abs(price - bb_upper) < 0.02 * price:
         score -= 1
     if abs(price - ind["bb_lower"]) < 0.02 * price:
         score += 1
 
+    # 4. MACD
     if macd_hist < 0:
         score -= 1
     elif macd_hist > 0:
         score += 1
 
+    # 5. Сезонность
     score += season_score
+
+    # 6. Запасы
     score += storage_score
+
+    # 7. Уровни
     score += level_score
+
+    # 8. Новости
     score += news_score
+
+    # 9. Powerburn
     score += pb_score
 
     return max(-15, min(15, score))
 
 def determine_signal(score):
+    """Превращает score в текстовый сигнал."""
     if score >= 4:
         return "🟢 СИЛЬНЫЙ ЛОНГ"
     elif score >= 2:
@@ -681,7 +723,8 @@ def determine_signal(score):
 # ============================================================
 
 def send_telegram(text, is_change_alert=False):
-    now = datetime.now()
+    """Отправка сообщения в Telegram. Вне CME-часов — только лог."""
+    now = datetime.now(MSK)
     is_cme_hours = CME_START_HOUR_MSK <= now.hour < CME_END_HOUR_MSK
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -690,7 +733,7 @@ def send_telegram(text, is_change_alert=False):
 
     if not is_cme_hours and not is_change_alert:
         logging.info(f"Вне CME-часов — Telegram не отправляется: {text[:100]}")
-        print("[Вне CME-часов] Сигнал залогирован, но не отправлен в Telegram")
+        print(f"[Вне CME-часов] Сигнал залогирован, но не отправлен в Telegram")
         return False
 
     full_text = text
@@ -756,15 +799,15 @@ def should_send_signal(signal, score, price, prev_signal, prev_score,
     if prev_signal and prev_signal != signal:
         return True, "change"
 
-    # 2. Нет предыдущего сигнала (первый запуск) → отправляем
+    # 2. ПЕРВЫЙ ЗАПУСК → Отправляем ВСЕГДА (даже вне CME)
     if not prev_signal:
-        return True, "first_run"
+        return True, "first_run_force"
 
     # 3. Сигнал тот же, но score значительно изменился
     if abs(score - prev_score) >= SCORE_CHANGE_THRESHOLD:
         return True, f"score_change ({prev_score:+d} → {score:+d})"
 
-    # 4. Сигнал и score те же — регулярный отчёт раз в REGULAR_INTERVAL_HOURS
+    # 4. Регулярный отчёт ТОЛЬКО в CME часы
     if is_cme and prev_timestamp:
         try:
             last_dt = datetime.fromisoformat(prev_timestamp)
@@ -784,11 +827,12 @@ def should_send_signal(signal, score, price, prev_signal, prev_score,
 # ============================================================
 
 def main():
-    now = datetime.now()
-    logging.info(f"=== Запуск цикла {now.strftime('%Y-%m-%d %H:%M:%S')} ===")
+    now = datetime.now(MSK)
+    logging.info(f"=== Запуск цикла {now.strftime('%Y-%m-%d %H:%M:%S')} МСК ===")
 
+    # Загрузка цен
     try:
-        df = fetch_prices()
+        df, source_label = fetch_prices()
         if len(df) < 50:
             logging.error("Недостаточно данных для анализа")
             return
@@ -796,8 +840,10 @@ def main():
         logging.error(f"Критическая ошибка загрузки цен: {e}")
         return
 
+    # Индикаторы
     ind = calc_indicators(df)
 
+    # Уровни
     support_lvls, resistance_lvls = find_swing_levels(df)
     pivots = calc_pivots(df)
     vp = volume_profile(df, lookback=60, num_bins=40)
@@ -805,25 +851,32 @@ def main():
         ind["price"], vp, support_lvls, resistance_lvls, pivots
     )
 
+    # Запасы
     storage_bcf, build, forecast = get_eia_storage()
     storage_score, storage_msg = score_storage(storage_bcf, build, forecast)
 
+    # Сезонность
     season_score = seasonality_score(now.month)
 
+    # Новости
     news_titles = parse_news()
     news_score, news_msg = score_news(news_titles)
 
+    # Powerburn
     pb_data = fetch_powerburn()
     pb_score, pb_msg = score_powerburn(pb_data)
 
+    # Общий скоринг
     total_score = calculate_score(
         ind, level_score, storage_score, season_score, news_score, pb_score
     )
 
+    # Сигнал
     signal = determine_signal(total_score)
     price = ind["price"]
     atr = ind["atr"]
 
+    # Уровни сделки
     is_long  = "ЛОНГ" in signal
     is_short = "ШОРТ" in signal
 
@@ -863,7 +916,7 @@ def main():
     logging.info(log_line)
     print(log_line)
 
-    # Сохраняем актуальный сигнал ДО отправки (чтобы даже при ошибке TG не зацикливаться)
+    # Сохраняем актуальный сигнал ДО отправки
     save_last_signal(signal, total_score, price)
 
     # Формирование сообщения
@@ -880,6 +933,20 @@ def main():
         msg += f"SL: ${sl:.3f}\n"
         msg += f"TP1: ${tp1:.3f} | TP2: ${tp2:.3f}\n"
         msg += f"R/R: {rr1:.2f}\n"
+
+    # ── Блок источников данных ──
+    msg += "━━━━ ИСТОЧНИКИ ━━━━\n"
+    msg += f"Основной: {source_label}\n"
+
+    if "Open" in df.columns and not df["Open"].isna().all():
+        msg += "✅ Yahoo Finance (NG=F): данные загружены\n"
+    else:
+        msg += "❌ Yahoo Finance: данные недоступны\n"
+
+    if "EIA_Spot" in df.columns and not df["EIA_Spot"].isna().all():
+        msg += "✅ EIA API (Henry Hub спот): данные загружены\n"
+    else:
+        msg += "❌ EIA API: данные недоступны\n"
 
     msg += "━━━━ ИНДИКАТОРЫ ━━━━\n"
     msg += f"RSI: {ind['rsi']:.1f} | MA50: ${ind['ma50']:.3f} | MA200: ${ind['ma200']:.3f}\n"
@@ -912,7 +979,6 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys
     mode = sys.argv[1] if len(sys.argv) > 1 else "--once"
 
     if mode == "--once":
