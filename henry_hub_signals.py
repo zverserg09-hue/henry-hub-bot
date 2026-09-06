@@ -4,8 +4,9 @@ Henry Hub Natural Gas — автоматическая система сигна
 Источники цен: Yahoo Finance (NG=F фьючерс) + EIA API v2 (Henry Hub спот, RNGWHHD)
 Режимы: --once (один прогон) | --loop (цикл) | --test (без Telegram)
 
-ВАЖНО: EIA API v2 не декодирует %5B/%5D (закодированные квадратные скобки),
-поэтому URL для EIA собирается вручную строкой, а не через params=dict в requests.
+ИСПРАВЛЕНО:
+1. requests кодирует [] в %5B/%5D — теперь используется PreparedRequest с ручным URL
+2. Date mismatch между Yahoo (21:00) и EIA (00:00) — теперь .normalize() перед join
 """
 
 import os
@@ -53,6 +54,7 @@ logging.basicConfig(
     format="%(asctime)s | %(message)s",
 )
 
+# ── Сессия с retry ──
 def get_session():
     session = requests.Session()
     retry = Retry(
@@ -66,6 +68,18 @@ def get_session():
     return session
 
 session = get_session()
+
+# ── КЛЮЧЕВОЕ: отправка запроса к EIA с сохранением [] в URL ──
+def eia_get(url, timeout=15):
+    """
+    requests кодирует [ ] в %5B %5D даже в готовой строке URL.
+    EIA API не декодирует их обратно → facets не работают.
+    Решение: PreparedRequest.prepare() → подменяем url на исходный.
+    """
+    req = requests.Request("GET", url, headers={"User-Agent": "Mozilla/5.0"})
+    prepared = req.prepare()
+    prepared.url = url  # ← подмена закодированного URL на исходный со скобками
+    return session.send(prepared, timeout=timeout)
 
 # ============================================================
 # МОДУЛЬ 1: ЦЕНОВЫЕ ДАННЫЕ — Yahoo + EIA
@@ -93,96 +107,78 @@ def fetch_prices_yahoo():
         })
         df.dropna(inplace=True)
         df.set_index("Date", inplace=True)
+        df.index = df.index.normalize()  # ← нормализация дат (убираем время)
         logging.info(f"Yahoo: получено {len(df)} свечей")
         return df
     except Exception as e:
         logging.error(f"Ошибка загрузки цен Yahoo: {e}")
         return None
 
-
 def fetch_prices_eia():
     """
     EIA API v2 — Henry Hub спот (RNGWHHD).
     Маршрут: natural-gas/pri/fut/data/
-    Facet: facets[series][] = RNGWHHD
-
-    ВАЖНО: URL собирается вручную, т.к. requests кодирует [] в %5B/%5D,
-    а EIA API не декодирует их обратно — facets не распознаются.
+    Facet: facets[series][]=RNGWHHD
+    URL собирается вручную, отправляется через eia_get() для сохранения скобок.
     """
     if not EIA_API_KEY:
         logging.info("EIA API key не задан — цены EIA пропускаются")
         return None
 
-    # Пробуем два эндпоинта: pri/fut (фьючерсы+спот) и pri/sum (сводные цены)
-    endpoints = [
-        {
-            "url": "https://api.eia.gov/v2/natural-gas/pri/fut/data/",
-            "facets": "facets[series][]=RNGWHHD",
-            "label": "pri/fut",
-        },
-        {
-            "url": "https://api.eia.gov/v2/natural-gas/pri/sum/data/",
-            "facets": "facets[series][]=RNGWHHD",
-            "label": "pri/sum",
-        },
-    ]
+    key_preview = EIA_API_KEY[:4] + "..." + EIA_API_KEY[-4:] if len(EIA_API_KEY) > 8 else "***"
+    logging.info(f"[EIA Prices] Ключ установлен: {key_preview}")
 
-    for ep in endpoints:
-        try:
-            # РУЧНАЯ СБОРКА URL — без params=dict, чтобы скобки не кодировались
-            url = (
-                f"{ep['url']}"
-                f"?api_key={quote(EIA_API_KEY, safe='')}"
-                f"&frequency=daily"
-                f"&data[0]=value"
-                f"&{ep['facets']}"
-                f"&sort[0][column]=period"
-                f"&sort[0][direction]=desc"
-                f"&length=730"
-            )
+    url = (
+        f"https://api.eia.gov/v2/natural-gas/pri/fut/data/"
+        f"?api_key={EIA_API_KEY}"
+        f"&frequency=daily"
+        f"&data[0]=value"
+        f"&facets[series][]=RNGWHHD"
+        f"&sort[0][column]=period"
+        f"&sort[0][direction]=desc"
+        f"&length=730"
+    )
 
-            logging.info(f"[EIA Prices] Попытка ({ep['label']}): {url[:120]}...")
+    logging.info(f"[EIA Prices] Запрос: {url[:100]}...")
 
-            r = session.get(url, timeout=15)
+    try:
+        r = eia_get(url, timeout=15)
 
-            logging.info(f"[EIA Prices] {ep['label']} → HTTP {r.status_code}")
+        logging.info(f"[EIA Prices] HTTP {r.status_code}, Content-Type: {r.headers.get('content-type', '')}")
 
-            if r.status_code != 200:
-                logging.error(f"[EIA Prices] {ep['label']} ответ: {r.text[:500]}")
-                continue
+        if r.status_code != 200:
+            logging.error(f"[EIA Prices] Ответ: {r.text[:500]}")
+            return None
 
-            data = r.json()
-            records = data.get("response", {}).get("data", [])
+        data = r.json()
+        records = data.get("response", {}).get("data", [])
 
-            logging.info(f"[EIA Prices] {ep['label']} → записей: {len(records)}")
+        logging.info(f"[EIA Prices] Получено записей: {len(records)}")
 
-            if not records:
-                logging.warning(f"[EIA Prices] {ep['label']} — пустой массив data")
-                continue
+        if not records:
+            logging.warning("[EIA Prices] Пустой массив data — проверьте серию RNGWHHD")
+            return None
 
-            df = pd.DataFrame(records)
-            df["Date"] = pd.to_datetime(df["period"])
-            df["Close"] = pd.to_numeric(df["value"], errors="coerce")
-            df.dropna(subset=["Close"], inplace=True)
-            df = df.sort_values("Date").set_index("Date")
+        df = pd.DataFrame(records)
+        df["Date"] = pd.to_datetime(df["period"])
+        df["Close"] = pd.to_numeric(df["value"], errors="coerce")
+        df.dropna(subset=["Close"], inplace=True)
+        df = df.sort_values("Date").set_index("Date")
+        df.index = df.index.normalize()  # ← нормализация дат
 
-            # У EIA спот-цены только Close — синтетически достраиваем OHLC
-            df["Open"]  = df["Close"].shift(1)
-            df["High"]  = df[["Open", "Close"]].max(axis=1)
-            df["Low"]   = df[["Open", "Close"]].min(axis=1)
-            df["Volume"] = 0
-            df.dropna(inplace=True)
+        # У EIA спот-цены только Close — синтетически достраиваем OHLC
+        df["Open"]  = df["Close"].shift(1)
+        df["High"]  = df[["Open", "Close"]].max(axis=1)
+        df["Low"]   = df[["Open", "Close"]].min(axis=1)
+        df["Volume"] = 0
+        df.dropna(inplace=True)
 
-            logging.info(f"✅ EIA: получено {len(df)} дневных цен Henry Hub (через {ep['label']})")
-            return df
+        logging.info(f"✅ EIA: получено {len(df)} дневных цен Henry Hub")
+        return df
 
-        except Exception as e:
-            logging.error(f"[EIA Prices] {ep['label']} exception: {e}")
-            continue
-
-    logging.error("❌ EIA: все эндпоинты цен недоступны")
-    return None
-
+    except Exception as e:
+        logging.error(f"Ошибка загрузки цен EIA: {e}")
+        return None
 
 def fetch_prices():
     df_yahoo = fetch_prices_yahoo()
@@ -203,10 +199,14 @@ def fetch_prices():
         logging.error("[ИСТОЧНИКИ] Не удалось получить данные ни из Yahoo, ни из EIA")
         raise RuntimeError("Не удалось получить достаточно данных ни из Yahoo, ни из EIA")
 
+    # Добавляем справочную колонку со спот-ценой EIA
     if df_eia is not None:
         eia_close = df_eia["Close"].rename("EIA_Spot")
+        # Оба индекса уже нормализованы (без времени) → join сработает
         primary = primary.join(eia_close, how="left")
-        logging.info("[ИСТОЧНИКИ] Данные EIA добавлены как справочная колонка EIA_Spot")
+        matched = primary["EIA_Spot"].notna().sum()
+        total = len(primary)
+        logging.info(f"[ИСТОЧНИКИ] EIA_Spot: {matched}/{total} дат совпали при join")
     else:
         primary["EIA_Spot"] = np.nan
         logging.warning("[ИСТОЧНИКИ] Данные EIA недоступны — колонка EIA_Spot заполнена NaN")
@@ -384,14 +384,13 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     return msg, level_score, nearest_sup, nearest_res
 
 # ============================================================
-# МОДУЛЬ 5: ЗАПАСЫ EIA (stor/wkly, ручная сборка URL)
+# МОДУЛЬ 5: ЗАПАСЫ EIA (stor/wkly, eia_get для сохранения скобок)
 # ============================================================
 
 def get_eia_storage():
     """
     EIA API v2 — недельные запасы природного газа.
     Маршрут: natural-gas/stor/wkly/data/
-    URL собирается вручную (без params dict) для корректной передачи скобок.
     """
     if not EIA_API_KEY:
         logging.info("EIA API key не задан — fallback-значения запасов")
@@ -403,31 +402,30 @@ def get_eia_storage():
         {"facets": "facets[process][]=SAV", "label": "process=SAV"},
         {"facets": "facets[duoarea][]=NUS", "label": "duoarea=NUS"},
         {"facets": "facets[region][]=US", "label": "region=US"},
-        {"facets": "", "label": "без facets (все записи)"},
+        {"facets": "", "label": "без facets"},
     ]
 
     base_url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
 
     for attempt in attempts:
         try:
-            url_parts = [
-                f"{base_url}",
-                f"?api_key={quote(EIA_API_KEY, safe='')}",
-                "&frequency=weekly",
-                "&data[0]=value",
-            ]
+            url = (
+                f"{base_url}"
+                f"?api_key={EIA_API_KEY}"
+                f"&frequency=weekly"
+                f"&data[0]=value"
+            )
             if attempt["facets"]:
-                url_parts.append(f"&{attempt['facets']}")
-            url_parts.extend([
-                "&sort[0][column]=period",
-                "&sort[0][direction]=desc",
-                "&length=50",
-            ])
-            url = "".join(url_parts)
+                url += f"&{attempt['facets']}"
+            url += (
+                f"&sort[0][column]=period"
+                f"&sort[0][direction]=desc"
+                f"&length=50"
+            )
 
-            logging.info(f"[EIA Storage] Попытка ({attempt['label']}): {url[:150]}...")
+            logging.info(f"[EIA Storage] Попытка ({attempt['label']}): {url[:120]}...")
 
-            r = session.get(url, timeout=15)
+            r = eia_get(url, timeout=15)
             logging.info(f"[EIA Storage] {attempt['label']} → HTTP {r.status_code}")
 
             if r.status_code != 200:
@@ -449,7 +447,6 @@ def get_eia_storage():
                     us_records.append(rec)
 
             if not us_records and records:
-                # Берём запись с максимальным value
                 us_records = [max(records, key=lambda r: float(r.get("value", 0) or 0))]
 
             if len(us_records) >= 2:
