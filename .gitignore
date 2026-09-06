@@ -1,1 +1,16 @@
+# Кэш цен (обновляется скриптом раз в сутки)
+cache_prices_ng.csv
+
+# Логи
+henry_hub_signals.log
+*.log
+
+# Файл последнего сигнала
+last_signal.json
+
+# Временные файлы Python
+__pycache__/
+*.pyc
+*.pyo
+
 
