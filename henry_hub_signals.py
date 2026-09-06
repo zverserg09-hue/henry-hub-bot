@@ -3,6 +3,9 @@ Henry Hub Natural Gas — автоматическая система сигна
 Анализ: техника + уровни + Volume Profile + запасы EIA + новости + Powerburn
 Источники цен: Yahoo Finance (NG=F фьючерс) + EIA API v2 (Henry Hub спот, RNGWHHD)
 Режимы: --once (один прогон) | --loop (цикл) | --test (без Telegram)
+
+ВАЖНО: EIA API v2 не декодирует %5B/%5D (закодированные квадратные скобки),
+поэтому URL для EIA собирается вручную строкой, а не через params=dict в requests.
 """
 
 import os
@@ -15,6 +18,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 import requests
 import pandas as pd
@@ -95,56 +99,90 @@ def fetch_prices_yahoo():
         logging.error(f"Ошибка загрузки цен Yahoo: {e}")
         return None
 
+
 def fetch_prices_eia():
     """
     EIA API v2 — Henry Hub спот (RNGWHHD).
     Маршрут: natural-gas/pri/fut/data/
     Facet: facets[series][] = RNGWHHD
+
+    ВАЖНО: URL собирается вручную, т.к. requests кодирует [] в %5B/%5D,
+    а EIA API не декодирует их обратно — facets не распознаются.
     """
     if not EIA_API_KEY:
         logging.info("EIA API key не задан — цены EIA пропускаются")
         return None
 
-    try:
-        url = "https://api.eia.gov/v2/natural-gas/pri/fut/data/"
-        params = {
-            "api_key": EIA_API_KEY,
-            "frequency": "daily",
-            "data[0]": "value",
-            "facets[series][]": "RNGWHHD",
-            "sort[0][column]": "period",
-            "sort[0][direction]": "desc",
-            "length": 730,
-        }
-        r = session.get(url, params=params, timeout=15)
+    # Пробуем два эндпоинта: pri/fut (фьючерсы+спот) и pri/sum (сводные цены)
+    endpoints = [
+        {
+            "url": "https://api.eia.gov/v2/natural-gas/pri/fut/data/",
+            "facets": "facets[series][]=RNGWHHD",
+            "label": "pri/fut",
+        },
+        {
+            "url": "https://api.eia.gov/v2/natural-gas/pri/sum/data/",
+            "facets": "facets[series][]=RNGWHHD",
+            "label": "pri/sum",
+        },
+    ]
 
-        if r.status_code != 200:
-            logging.error(f"[EIA Prices] HTTP {r.status_code}: {r.text[:300]}")
-            return None
+    for ep in endpoints:
+        try:
+            # РУЧНАЯ СБОРКА URL — без params=dict, чтобы скобки не кодировались
+            url = (
+                f"{ep['url']}"
+                f"?api_key={quote(EIA_API_KEY, safe='')}"
+                f"&frequency=daily"
+                f"&data[0]=value"
+                f"&{ep['facets']}"
+                f"&sort[0][column]=period"
+                f"&sort[0][direction]=desc"
+                f"&length=730"
+            )
 
-        data = r.json()
-        records = data.get("response", {}).get("data", [])
+            logging.info(f"[EIA Prices] Попытка ({ep['label']}): {url[:120]}...")
 
-        if not records:
-            logging.warning("[EIA Prices] Пустой список данных для серии RNGWHHD")
-            return None
+            r = session.get(url, timeout=15)
 
-        df = pd.DataFrame(records)
-        df["Date"] = pd.to_datetime(df["period"])
-        df["Close"] = pd.to_numeric(df["value"], errors="coerce")
-        df.dropna(subset=["Close"], inplace=True)
-        df = df.sort_values("Date").set_index("Date")
+            logging.info(f"[EIA Prices] {ep['label']} → HTTP {r.status_code}")
 
-        df["Open"]  = df["Close"].shift(1)
-        df["High"]  = df[["Open", "Close"]].max(axis=1)
-        df["Low"]   = df[["Open", "Close"]].min(axis=1)
-        df["Volume"] = 0
-        df.dropna(inplace=True)
-        logging.info(f"EIA: получено {len(df)} дневных цен спот Henry Hub")
-        return df
-    except Exception as e:
-        logging.error(f"Ошибка загрузки цен EIA: {e}")
-        return None
+            if r.status_code != 200:
+                logging.error(f"[EIA Prices] {ep['label']} ответ: {r.text[:500]}")
+                continue
+
+            data = r.json()
+            records = data.get("response", {}).get("data", [])
+
+            logging.info(f"[EIA Prices] {ep['label']} → записей: {len(records)}")
+
+            if not records:
+                logging.warning(f"[EIA Prices] {ep['label']} — пустой массив data")
+                continue
+
+            df = pd.DataFrame(records)
+            df["Date"] = pd.to_datetime(df["period"])
+            df["Close"] = pd.to_numeric(df["value"], errors="coerce")
+            df.dropna(subset=["Close"], inplace=True)
+            df = df.sort_values("Date").set_index("Date")
+
+            # У EIA спот-цены только Close — синтетически достраиваем OHLC
+            df["Open"]  = df["Close"].shift(1)
+            df["High"]  = df[["Open", "Close"]].max(axis=1)
+            df["Low"]   = df[["Open", "Close"]].min(axis=1)
+            df["Volume"] = 0
+            df.dropna(inplace=True)
+
+            logging.info(f"✅ EIA: получено {len(df)} дневных цен Henry Hub (через {ep['label']})")
+            return df
+
+        except Exception as e:
+            logging.error(f"[EIA Prices] {ep['label']} exception: {e}")
+            continue
+
+    logging.error("❌ EIA: все эндпоинты цен недоступны")
+    return None
+
 
 def fetch_prices():
     df_yahoo = fetch_prices_yahoo()
@@ -346,54 +384,72 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     return msg, level_score, nearest_sup, nearest_res
 
 # ============================================================
-# МОДУЛЬ 5: ЗАПАСЫ EIA (stor/wkly, каскадный fallback)
+# МОДУЛЬ 5: ЗАПАСЫ EIA (stor/wkly, ручная сборка URL)
 # ============================================================
 
 def get_eia_storage():
+    """
+    EIA API v2 — недельные запасы природного газа.
+    Маршрут: natural-gas/stor/wkly/data/
+    URL собирается вручную (без params dict) для корректной передачи скобок.
+    """
     if not EIA_API_KEY:
         logging.info("EIA API key не задан — fallback-значения запасов")
         return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
 
-    url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
-
     # Каскад: пробуем разные комбинации facets
-    facets_to_try = [
-        {"facets[process][]": "SAV", "facets[region][]": "US"},
-        {"facets[process][]": "SAV", "facets[duoarea][]": "NUS"},
-        {},
+    attempts = [
+        {"facets": "facets[duoarea][]=NUS&facets[process][]=SAV", "label": "duoarea=NUS+process=SAV"},
+        {"facets": "facets[process][]=SAV", "label": "process=SAV"},
+        {"facets": "facets[duoarea][]=NUS", "label": "duoarea=NUS"},
+        {"facets": "facets[region][]=US", "label": "region=US"},
+        {"facets": "", "label": "без facets (все записи)"},
     ]
 
-    for i, extra_facets in enumerate(facets_to_try):
+    base_url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
+
+    for attempt in attempts:
         try:
-            params = {
-                "api_key": EIA_API_KEY,
-                "frequency": "weekly",
-                "data[0]": "value",
-                "sort[0][column]": "period",
-                "sort[0][direction]": "desc",
-                "length": 50,
-            }
-            params.update(extra_facets)
-            r = session.get(url, params=params, timeout=15)
+            url_parts = [
+                f"{base_url}",
+                f"?api_key={quote(EIA_API_KEY, safe='')}",
+                "&frequency=weekly",
+                "&data[0]=value",
+            ]
+            if attempt["facets"]:
+                url_parts.append(f"&{attempt['facets']}")
+            url_parts.extend([
+                "&sort[0][column]=period",
+                "&sort[0][direction]=desc",
+                "&length=50",
+            ])
+            url = "".join(url_parts)
+
+            logging.info(f"[EIA Storage] Попытка ({attempt['label']}): {url[:150]}...")
+
+            r = session.get(url, timeout=15)
+            logging.info(f"[EIA Storage] {attempt['label']} → HTTP {r.status_code}")
 
             if r.status_code != 200:
-                logging.warning(f"[EIA Storage] Попытка {i+1}: HTTP {r.status_code}")
+                logging.warning(f"[EIA Storage] {attempt['label']} ответ: {r.text[:300]}")
                 continue
 
             records = r.json().get("response", {}).get("data", [])
+            logging.info(f"[EIA Storage] {attempt['label']} → записей: {len(records)}")
+
             if not records:
-                logging.info(f"[EIA Storage] Попытка {i+1}: пусто (facets={extra_facets})")
                 continue
 
             # Ищем US total
             us_records = []
             for rec in records:
                 area = str(rec.get("area", "")) + str(rec.get("area-name", "")) + \
-                       str(rec.get("region", "")) + str(rec.get("duoarea", ""))
-                if "US" in area or "U.S." in area or "United States" in area:
+                       str(rec.get("duoarea", "")) + str(rec.get("region", ""))
+                if "US" in area or "U.S." in area or "United States" in area or "NUS" in area:
                     us_records.append(rec)
 
             if not us_records and records:
+                # Берём запись с максимальным value
                 us_records = [max(records, key=lambda r: float(r.get("value", 0) or 0))]
 
             if len(us_records) >= 2:
@@ -401,23 +457,24 @@ def get_eia_storage():
                 current = float(us_records[0]["value"])
                 prev = float(us_records[1]["value"])
                 build = current - prev
-                logging.info(f"[EIA Storage] Попытка {i+1}: текущие={current:.0f} Bcf, закачка={build:.0f} Bcf")
+                logging.info(f"✅ [EIA Storage] {attempt['label']}: текущие={current:.0f} Bcf, закачка={build:.0f} Bcf")
                 return current, build, STORAGE_FORECAST
             elif len(us_records) == 1:
                 current = float(us_records[0]["value"])
-                logging.warning(f"[EIA Storage] Попытка {i+1}: 1 запись ({current:.0f} Bcf)")
+                logging.warning(f"[EIA Storage] {attempt['label']}: 1 запись ({current:.0f} Bcf)")
                 return current, LAST_STORAGE_BUILD, STORAGE_FORECAST
+
         except Exception as e:
-            logging.error(f"[EIA Storage] Попытка {i+1} error: {e}")
+            logging.error(f"[EIA Storage] {attempt['label']} exception: {e}")
             continue
 
-    logging.warning("[EIA Storage] Все попытки неудачны — fallback")
+    logging.warning("❌ [EIA Storage] Все попытки неудачны — fallback")
     return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
 
 def score_storage(storage_bcf, build, forecast):
     score = 0
-    msg = f"Текущие: {storage_bcf:.0f} Bcf ({((storage_bcf - 3000) / 3000 * 100):+.1f}% к 5л ср.)\n"
     pct = (storage_bcf - 3000) / 3000 * 100
+    msg = f"Текущие: {storage_bcf:.0f} Bcf ({pct:+.1f}% к 5л ср.)\n"
     if pct > 5:
         score -= 2
         msg += "📈 Запасы выше нормы → давление на цену\n"
