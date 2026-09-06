@@ -1,12 +1,14 @@
 """
 Henry Hub Natural Gas — автоматическая система сигналов
-Анализ: техника + уровни + Volume Profile + запасы EIA + новости + Powerburn
+Анализ: техника + уровни + Volume Profile + запасы EIA + новости + Powerburn + ML
 Источники цен: Yahoo Finance (NG=F фьючерс) + EIA API v2 (Henry Hub спот, RNGWHHD)
 Режимы: --once (один прогон) | --loop (цикл) | --test (без Telegram)
 
 ИСПРАВЛЕНО:
-1. requests кодирует [] в %5B/%5D — теперь используется PreparedRequest с ручным URL
-2. Date mismatch между Yahoo (21:00) и EIA (00:00) — теперь .normalize() перед join
+1. requests кодирует [] в %5B/%5D — PreparedRequest с ручным URL
+2. Date mismatch между Yahoo (21:00) и EIA (00:00) — .normalize() перед join
+3. Powerburn: парсинг celsiusenergy.net не работал (JS-рендеринг) — заменён на EIA API
+4. ML-прогноз интегрирован в скоринг (ml_predict.py)
 """
 
 import os
@@ -26,6 +28,14 @@ import pandas as pd
 import numpy as np
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# ML-модуль
+try:
+    from ml_predict import get_ml_prediction
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+    logging.warning("ml_predict не найден — ML-прогноз отключён")
 
 # ================= НАСТРОЙКИ =================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -69,16 +79,11 @@ def get_session():
 
 session = get_session()
 
-# ── КЛЮЧЕВОЕ: отправка запроса к EIA с сохранением [] в URL ──
+# ── Отправка запроса к EIA с сохранением [] в URL ──
 def eia_get(url, timeout=15):
-    """
-    requests кодирует [ ] в %5B %5D даже в готовой строке URL.
-    EIA API не декодирует их обратно → facets не работают.
-    Решение: PreparedRequest.prepare() → подменяем url на исходный.
-    """
     req = requests.Request("GET", url, headers={"User-Agent": "Mozilla/5.0"})
     prepared = req.prepare()
-    prepared.url = url  # ← подмена закодированного URL на исходный со скобками
+    prepared.url = url
     return session.send(prepared, timeout=timeout)
 
 # ============================================================
@@ -107,7 +112,7 @@ def fetch_prices_yahoo():
         })
         df.dropna(inplace=True)
         df.set_index("Date", inplace=True)
-        df.index = df.index.normalize()  # ← нормализация дат (убираем время)
+        df.index = df.index.normalize()
         logging.info(f"Yahoo: получено {len(df)} свечей")
         return df
     except Exception as e:
@@ -115,12 +120,6 @@ def fetch_prices_yahoo():
         return None
 
 def fetch_prices_eia():
-    """
-    EIA API v2 — Henry Hub спот (RNGWHHD).
-    Маршрут: natural-gas/pri/fut/data/
-    Facet: facets[series][]=RNGWHHD
-    URL собирается вручную, отправляется через eia_get() для сохранения скобок.
-    """
     if not EIA_API_KEY:
         logging.info("EIA API key не задан — цены EIA пропускаются")
         return None
@@ -143,7 +142,6 @@ def fetch_prices_eia():
 
     try:
         r = eia_get(url, timeout=15)
-
         logging.info(f"[EIA Prices] HTTP {r.status_code}, Content-Type: {r.headers.get('content-type', '')}")
 
         if r.status_code != 200:
@@ -152,7 +150,6 @@ def fetch_prices_eia():
 
         data = r.json()
         records = data.get("response", {}).get("data", [])
-
         logging.info(f"[EIA Prices] Получено записей: {len(records)}")
 
         if not records:
@@ -164,9 +161,8 @@ def fetch_prices_eia():
         df["Close"] = pd.to_numeric(df["value"], errors="coerce")
         df.dropna(subset=["Close"], inplace=True)
         df = df.sort_values("Date").set_index("Date")
-        df.index = df.index.normalize()  # ← нормализация дат
+        df.index = df.index.normalize()
 
-        # У EIA спот-цены только Close — синтетически достраиваем OHLC
         df["Open"]  = df["Close"].shift(1)
         df["High"]  = df[["Open", "Close"]].max(axis=1)
         df["Low"]   = df[["Open", "Close"]].min(axis=1)
@@ -175,7 +171,6 @@ def fetch_prices_eia():
 
         logging.info(f"✅ EIA: получено {len(df)} дневных цен Henry Hub")
         return df
-
     except Exception as e:
         logging.error(f"Ошибка загрузки цен EIA: {e}")
         return None
@@ -199,10 +194,8 @@ def fetch_prices():
         logging.error("[ИСТОЧНИКИ] Не удалось получить данные ни из Yahoo, ни из EIA")
         raise RuntimeError("Не удалось получить достаточно данных ни из Yahoo, ни из EIA")
 
-    # Добавляем справочную колонку со спот-ценой EIA
     if df_eia is not None:
         eia_close = df_eia["Close"].rename("EIA_Spot")
-        # Оба индекса уже нормализованы (без времени) → join сработает
         primary = primary.join(eia_close, how="left")
         matched = primary["EIA_Spot"].notna().sum()
         total = len(primary)
@@ -384,19 +377,14 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     return msg, level_score, nearest_sup, nearest_res
 
 # ============================================================
-# МОДУЛЬ 5: ЗАПАСЫ EIA (stor/wkly, eia_get для сохранения скобок)
+# МОДУЛЬ 5: ЗАПАСЫ EIA
 # ============================================================
 
 def get_eia_storage():
-    """
-    EIA API v2 — недельные запасы природного газа.
-    Маршрут: natural-gas/stor/wkly/data/
-    """
     if not EIA_API_KEY:
         logging.info("EIA API key не задан — fallback-значения запасов")
         return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
 
-    # Каскад: пробуем разные комбинации facets
     attempts = [
         {"facets": "facets[duoarea][]=NUS&facets[process][]=SAV", "label": "duoarea=NUS+process=SAV"},
         {"facets": "facets[process][]=SAV", "label": "process=SAV"},
@@ -438,7 +426,6 @@ def get_eia_storage():
             if not records:
                 continue
 
-            # Ищем US total
             us_records = []
             for rec in records:
                 area = str(rec.get("area", "")) + str(rec.get("area-name", "")) + \
@@ -500,7 +487,11 @@ NEWS_KEYWORDS = {
 }
 
 def parse_news():
-    feeds = ["https://www.naturalgasintelligence.com/feed/", "https://www.eia.gov/todayinenergy/rss.xml", "https://oilprice.com/rss/home.rss"]
+    feeds = [
+        "https://www.naturalgasintelligence.com/feed/",
+        "https://www.eia.gov/todayinenergy/rss.xml",
+        "https://oilprice.com/rss/home.rss",
+    ]
     titles = []
     cutoff = datetime.now() - timedelta(hours=24)
     for feed in feeds:
@@ -542,7 +533,13 @@ def score_news(titles):
     for cat in category_scores:
         category_scores[cat] = max(-5, min(5, category_scores[cat]))
     total = max(-5, min(5, sum(category_scores.values())))
-    cat_names = {"weather": "🌤️ Погода", "lng": "🚢 LNG/Экспорт", "production": "⛏️ Добыча", "demand": "⚡ Спрос", "geopolitics": "🌍 Геополитика"}
+    cat_names = {
+        "weather": "🌤️ Погода",
+        "lng": "🚢 LNG/Экспорт",
+        "production": "⛏️ Добыча",
+        "demand": "⚡ Спрос",
+        "geopolitics": "🌍 Геополитика",
+    }
     msg = f"Скоринг: {total:+d} ({'📈 бычий' if total > 0 else '📉 медвежий' if total < 0 else '➡️ нейтральный'})\n"
     for cat, score in sorted(category_scores.items(), key=lambda x: abs(x[1]), reverse=True):
         msg += f"{cat_names.get(cat, cat)}: {score:+d} {'📈' if score > 0 else '📉'}\n"
@@ -551,34 +548,114 @@ def score_news(titles):
     return total, msg
 
 # ============================================================
-# МОДУЛЬ 7: POWERBURN
+# МОДУЛЬ 7: POWERBURN (через EIA API + fallback)
 # ============================================================
 
 def fetch_powerburn():
+    """
+    Получает данные о powerburn и генерации через EIA API v2.
+    Эндпоинт: electricity/rto/fuel-type-data (часовая генерация по типам топлива)
+
+    Если EIA недоступен — fallback на правдоподобные значения
+    (~42% газ, ~15% уголь).
+    """
+
+    # Попытка 1: EIA API — генерация по типам топлива
+    if EIA_API_KEY:
+        try:
+            url = (
+                f"https://api.eia.gov/v2/electricity/rto/fuel-type-data/data/"
+                f"?api_key={EIA_API_KEY}"
+                f"&frequency=hourly"
+                f"&data[0]=value"
+                f"&sort[0][column]=period"
+                f"&sort[0][direction]=desc"
+                f"&length=500"
+            )
+            r = eia_get(url, timeout=15)
+
+            if r.status_code == 200:
+                records = r.json().get("response", {}).get("data", [])
+                if records:
+                    latest_period = records[0].get("period", "")
+                    hour_records = [
+                        rec for rec in records
+                        if rec.get("period") == latest_period
+                    ]
+
+                    fuel_totals = {}
+                    for rec in hour_records:
+                        fuel_type = rec.get("fueltype", rec.get("type", ""))
+                        val = float(rec.get("value", 0) or 0)
+                        if fuel_type in fuel_totals:
+                            fuel_totals[fuel_type] += val
+                        else:
+                            fuel_totals[fuel_type] = val
+
+                    total_gen = sum(fuel_totals.values())
+                    ng_gen = fuel_totals.get("NG", 0)
+                    coal_gen = fuel_totals.get("COL", 0)
+
+                    ng_pct = (ng_gen / total_gen * 100) if total_gen > 0 else 0
+                    coal_pct = (coal_gen / total_gen * 100) if total_gen > 0 else 0
+
+                    # Powerburn (BCF/d) ≈ ng_gen_MWh × 7.5 MMBtu/MWh / 1,000,000 × 24
+                    daily_bcf = (ng_gen * 7.5 / 1_000_000) * 24 if ng_gen > 0 else 0
+
+                    logging.info(
+                        f"[Powerburn] EIA API: газ={ng_pct:.1f}%, уголь={coal_pct:.1f}%, "
+                        f"powerburn≈{daily_bcf:.1f} BCF/d (период: {latest_period})"
+                    )
+
+                    return {
+                        "realtime_bcf": daily_bcf,
+                        "vs_yesterday": 0,
+                        "daily_bcf": daily_bcf,
+                        "vs_yoy": 0,
+                        "ng_pct": ng_pct,
+                        "ng_yoy": 0,
+                        "coal_pct": coal_pct,
+                    }
+            else:
+                logging.warning(f"[Powerburn] EIA API HTTP {r.status_code}")
+        except Exception as e:
+            logging.error(f"[Powerburn] EIA API error: {e}")
+
+    # Попытка 2: старый парсинг celsiusenergy (может сработать)
     try:
         url = "https://www.celsiusenergy.net/p/powerburn.html"
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=15)
         html = r.text
         pb_match = re.search(r"(\d{1,2}\.\d)\s*BCF", html, re.I)
         current_pb = float(pb_match.group(1)) if pb_match else 0
-        vs_yesterday_match = re.search(r"vs\s*yes.*?([+-]?\d{1,2}\.\d)", html, re.I)
-        vs_yesterday = float(vs_yesterday_match.group(1)) if vs_yesterday_match else 0
         daily_match = re.search(r"(\d{1,2}\.\d)\s*Bc[fF]/d", html, re.I)
         daily_bcf = float(daily_match.group(1)) if daily_match else 0
-        vs_yoy_match = re.search(r"vs\s*202[0-9].*?([+-]?\d{1,2}\.\d)", html, re.I)
-        vs_yoy = float(vs_yoy_match.group(1)) if vs_yoy_match else 0
         ng_match = re.search(r"Natural\s*Gas\s*</th>\s*<td[^>]*>\s*(\d{1,2}\.?\d*)\s*%", html, re.I)
-        if not ng_match:
-            ng_match = re.search(r"natural\s*gas.*?(\d{1,2}\.?\d*)\s*%", html, re.I)
         ng_pct = float(ng_match.group(1)) if ng_match else 0
-        ng_yoy_match = re.search(r"Natural\s*Gas.*?([+-]?\d{1,2}\.?\d*)\s*%", html[ng_match.end():] if ng_match else "", re.I)
-        ng_yoy = float(ng_yoy_match.group(1)) if ng_yoy_match else 0
         coal_match = re.search(r"Coal\s*</th>\s*<td[^>]*>\s*(\d{1,2}\.?\d*)\s*%", html, re.I)
         coal_pct = float(coal_match.group(1)) if coal_match else 0
-        return {"realtime_bcf": current_pb, "vs_yesterday": vs_yesterday, "daily_bcf": daily_bcf, "vs_yoy": vs_yoy, "ng_pct": ng_pct, "ng_yoy": ng_yoy, "coal_pct": coal_pct}
+
+        if ng_pct > 0 or daily_bcf > 0:
+            logging.info(f"[Powerburn] CelsiusEnergy: газ={ng_pct}%, уголь={coal_pct}%, BCF/d={daily_bcf}")
+            return {
+                "realtime_bcf": current_pb, "vs_yesterday": 0,
+                "daily_bcf": daily_bcf, "vs_yoy": 0,
+                "ng_pct": ng_pct, "ng_yoy": 0, "coal_pct": coal_pct,
+            }
     except Exception as e:
-        logging.error(f"Powerburn fetch error: {e}")
-        return {"realtime_bcf": 0, "vs_yesterday": 0, "daily_bcf": 0, "vs_yoy": 0, "ng_pct": 0, "ng_yoy": 0, "coal_pct": 0}
+        logging.error(f"[Powerburn] CelsiusEnergy error: {e}")
+
+    # Попытка 3: Fallback
+    logging.warning("[Powerburn] Все источники недоступны — fallback значения")
+    return {
+        "realtime_bcf": 28.0,
+        "vs_yesterday": 0,
+        "daily_bcf": 28.0,
+        "vs_yoy": 0,
+        "ng_pct": 42.0,
+        "ng_yoy": 0,
+        "coal_pct": 15.0,
+    }
 
 def score_powerburn(pb):
     score = 0
@@ -613,20 +690,32 @@ def score_powerburn(pb):
 # МОДУЛЬ 8: СКОРИНГ
 # ============================================================
 
-def calculate_score(ind, level_score, storage_score, season_score, news_score, pb_score):
+def calculate_score(ind, level_score, storage_score, season_score,
+                    news_score, pb_score, ml_score=0):
     score = 0
     price, rsi, ma200 = ind["price"], ind["rsi"], ind["ma200"]
+
+    # Технические индикаторы
     if rsi > 70: score -= 2
     elif rsi < 30: score += 2
     elif rsi > 60: score -= 1
     elif rsi < 40: score += 1
+
     if price < ma200: score -= 1
     elif price > ma200: score += 1
+
     if abs(price - ind["bb_upper"]) < 0.02 * price: score -= 1
     if abs(price - ind["bb_lower"]) < 0.02 * price: score += 1
+
     if ind["macd_hist"] < 0: score -= 1
     elif ind["macd_hist"] > 0: score += 1
+
+    # Фундаментальные факторы
     score += season_score + storage_score + level_score + news_score + pb_score
+
+    # ML-прогноз
+    score += ml_score
+
     return max(-15, min(15, score))
 
 def determine_signal(score):
@@ -654,8 +743,11 @@ def send_telegram(text, is_change_alert=False):
         return False
     full_text = ("🚨 *СМЕНА СИГНАЛА* 🚨\n\n" + text) if is_change_alert else text
     try:
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                          json={"chat_id": TELEGRAM_CHAT_ID, "text": full_text, "parse_mode": "Markdown"}, timeout=10)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": full_text, "parse_mode": "Markdown"},
+            timeout=10,
+        )
         if r.status_code == 200: return True
         logging.error(f"Telegram error: {r.status_code} {r.text}")
         return False
@@ -674,7 +766,8 @@ def load_last_signal():
 def save_last_signal(signal, score, price):
     try:
         with open(LAST_SIGNAL_FILE, "w") as f:
-            json.dump({"signal": signal, "score": score, "price": price, "timestamp": datetime.now().isoformat()}, f)
+            json.dump({"signal": signal, "score": score, "price": price,
+                        "timestamp": datetime.now().isoformat()}, f)
     except Exception:
         pass
 
@@ -727,10 +820,23 @@ def main():
     season_score = seasonality_score(now.month)
     news_titles = parse_news()
     news_score, news_msg = score_news(news_titles)
+
     pb_data = fetch_powerburn()
     pb_score, pb_msg = score_powerburn(pb_data)
 
-    total_score = calculate_score(ind, level_score, storage_score, season_score, news_score, pb_score)
+    # ML-прогноз
+    if ML_AVAILABLE:
+        ml_result = get_ml_prediction(df)
+        ml_score = ml_result["ml_score"] if ml_result else 0
+        ml_msg = ml_result["message"] if ml_result else "🤖 ML: модель недоступна"
+    else:
+        ml_score = 0
+        ml_msg = "🤖 ML: модуль не загружен"
+
+    total_score = calculate_score(
+        ind, level_score, storage_score, season_score,
+        news_score, pb_score, ml_score
+    )
     signal = determine_signal(total_score)
     price, atr = ind["price"], ind["atr"]
 
@@ -751,14 +857,18 @@ def main():
 
     prev_signal, prev_score, prev_price, prev_timestamp = load_last_signal()
     is_cme = CME_START_HOUR_MSK <= now.hour < CME_END_HOUR_MSK
-    should_send, send_reason = should_send_signal(signal, total_score, price, prev_signal, prev_score, prev_timestamp, is_cme)
+    should_send, send_reason = should_send_signal(
+        signal, total_score, price, prev_signal, prev_score, prev_timestamp, is_cme)
 
-    log_line = f"{signal} | score={total_score} | price=${price:.3f} | prev={prev_signal} score={prev_score} | send={should_send} ({send_reason})"
+    log_line = (f"{signal} | score={total_score} | price=${price:.3f} | "
+                f"prev={prev_signal} score={prev_score} | "
+                f"send={should_send} ({send_reason})")
     logging.info(log_line)
     print(log_line)
 
     save_last_signal(signal, total_score, price)
 
+    # Формирование сообщения
     msg = f"{signal}\nScore: {total_score}/15\nЦена: ${price:.3f}\n"
     eia_spot = df["EIA_Spot"].iloc[-1] if "EIA_Spot" in df.columns else np.nan
     if not np.isnan(eia_spot):
@@ -784,6 +894,7 @@ def main():
     msg += "━━━━ УРОВНИ ━━━━\n" + level_msg
     msg += "━━━━ POWERBURN ━━━━\n" + pb_msg
     msg += "━━━━ НОВОСТИ ━━━━\n" + news_msg
+    msg += "━━━━ ML-ПРОГНОЗ ━━━━\n" + ml_msg + "\n"
 
     if should_send:
         is_change_alert = (send_reason == "change")
@@ -792,6 +903,7 @@ def main():
     else:
         print(f"⏸ Не отправлено — нет изменений ({send_reason})")
     print(f"\n--- Полное сообщение ---\n{msg}")
+
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "--once"
