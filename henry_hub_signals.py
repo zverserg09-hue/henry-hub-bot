@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 import requests
 import pandas as pd
 import numpy as np
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ================= НАСТРОЙКИ =================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -47,6 +49,21 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(message)s",
 )
+
+# ── Сессия с retry для устойчивости к ошибкам EIA ──
+def get_session():
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    return session
+
+session = get_session()
 
 # ============================================================
 # МОДУЛЬ 1: ЦЕНОВЫЕ ДАННЫЕ — Yahoo + EIA
@@ -94,17 +111,22 @@ def fetch_prices_eia():
             "api_key": EIA_API_KEY,
             "frequency": "daily",
             "data[0]": "value",
-            "facets[series][]": "RNGWHHD",
+            "facets[series.series_id][]": "RNGWHHD",
             "sort[0][column]": "period",
             "sort[0][direction]": "desc",
             "length": 730,
         }
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
+        r = session.get(url, params=params, timeout=15)
+
+        if r.status_code != 200:
+            logging.error(f"[EIA Prices] Статус {r.status_code}: {r.text[:300]}")
+            return None
+
         data = r.json()
-        records = data["response"]["data"]
+        records = data.get("response", {}).get("data", [])
+
         if not records:
-            logging.warning("EIA: пустой ответ")
+            logging.warning("[EIA Prices] Пустой список данных. Проверьте facets и серию RNGWHHD.")
             return None
 
         df = pd.DataFrame(records)
@@ -112,6 +134,7 @@ def fetch_prices_eia():
         df["Close"] = pd.to_numeric(df["value"], errors="coerce")
         df.dropna(subset=["Close"], inplace=True)
         df = df.sort_values("Date").set_index("Date")
+
         # У EIA спот-цены только Close — синтетически достраиваем OHLC
         df["Open"]  = df["Close"].shift(1)
         df["High"]  = df[["Open", "Close"]].max(axis=1)
@@ -365,7 +388,7 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     return msg, level_score, nearest_sup, nearest_res
 
 # ============================================================
-# МОДУЛЬ 5: ЗАПАСЫ EIA (API v2)
+# МОДУЛЬ 5: ЗАПАСЫ EIA (API v2 — исправленные facets)
 # ============================================================
 
 def get_eia_storage():
@@ -385,13 +408,23 @@ def get_eia_storage():
             "sort[0][direction]": "desc",
             "length": 2,
         }
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
+        r = session.get(url, params=params, timeout=15)
+
+        if r.status_code != 200:
+            logging.error(f"[EIA Storage] Статус {r.status_code}: {r.text[:300]}")
+            return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
+
         data = r.json()
-        records = data["response"]["data"]
+        records = data.get("response", {}).get("data", [])
+
+        if not records or len(records) < 2:
+            logging.warning("[EIA Storage] Недостаточно данных в ответе")
+            return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
+
         current = float(records[0]["value"])
         prev = float(records[1]["value"])
         build = current - prev
+        logging.info(f"[EIA Storage] Текущие: {current:.0f} Bcf, закачка: {build:.0f} Bcf")
         return current, build, STORAGE_FORECAST
     except Exception as e:
         logging.error(f"EIA storage API v2 error: {e}")
@@ -602,7 +635,6 @@ def score_powerburn(pb):
     score = 0
     msg = ""
 
-    # Если парсинг не удался — явно сообщаем
     if pb["realtime_bcf"] == 0 and pb["daily_bcf"] == 0:
         msg += "⚠️ Данные недоступны (парсинг не удался)\n"
         return 0, msg
@@ -733,7 +765,7 @@ def send_telegram(text, is_change_alert=False):
 
     if not is_cme_hours and not is_change_alert:
         logging.info(f"Вне CME-часов — Telegram не отправляется: {text[:100]}")
-        print(f"[Вне CME-часов] Сигнал залогирован, но не отправлен в Telegram")
+        print("[Вне CME-часов] Сигнал залогирован, но не отправлен в Telegram")
         return False
 
     full_text = text
