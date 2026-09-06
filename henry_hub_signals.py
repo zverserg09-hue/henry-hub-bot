@@ -171,7 +171,7 @@ def fetch_eia_prices(max_retries=3):
                 "High": prices,
                 "Low": prices,
                 "Close": prices,
-                "Volume": * len(prices),
+                "Volume": len(prices),
             }
         )
         df.dropna(inplace=True)
