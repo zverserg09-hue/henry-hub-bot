@@ -630,15 +630,24 @@ def main():
         else "📰 Новостей за 6 часов нет"
     )
 
-    # 6. Итоговый скоринг
+    # 6. Итоговый скоринг и понятная рекомендация
     total_score = level_score + storage_score
-    score_emoji = "🟢" if total_score > 0 else "🔴" if total_score < 0 else "⚪"
+
+    if total_score <= -2:
+        signal_text = "🔴 СИЛЬНЫЙ ШОРТ"
+        signal_emoji = "🔴"
+    elif total_score >= 2:
+        signal_text = "🟢 СИЛЬНЫЙ ЛОНГ"
+        signal_emoji = "🟢"
+    else:
+        signal_text = "⚪ НЕЙТРАЛЬНО / БОКОВИК"
+        signal_emoji = "⚪"
 
     # Дата последней свечи
     last_date = df.index[-1].strftime("%Y-%m-%d")
 
     report = (
-        f"{score_emoji} **Henry Hub Signals** (Score: {total_score})\n\n"
+        f"{signal_emoji} **Henry Hub Signals — {signal_text}**\n\n"
         f"💵 Цена (EIA spot): ${ind['price']:.3f}\n"
         f"📅 Последняя дата данных: {last_date}\n"
         f"📈 RSI-14: {ind['rsi']:.2f} | MA50: ${ind['ma50']:.3f} | MA200: ${ind['ma200']:.3f}\n\n"
@@ -650,6 +659,7 @@ def main():
     logger.info("Report generated")
     send_telegram(report)
     logger.info("=== END HENRY HUB SIGNALS ===")
+
 
 
 if __name__ == "__main__":
