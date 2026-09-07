@@ -1,7 +1,7 @@
 """
 Henry Hub Natural Gas — автоматическая система сигналов
 Анализ: техника + уровни + Volume Profile + запасы EIA + новости + Powerburn + ML
-Источники цен: Yahoo Finance (NG=F фьючерс) + EIA API v2 (Henry Hub спот)
+Источники цен: Yahoo Finance (NG=F фьючерс) + EIA API v2 (Henry Hub спот, RNGWHHD)
 Режимы: --once (один прогон) | --loop (цикл) | --test (без Telegram)
 
 ИСПРАВЛЕНО:
@@ -10,8 +10,6 @@ Henry Hub Natural Gas — автоматическая система сигна
 3. Powerburn: парсинг celsiusenergy.net не работал (JS-рендеринг) — заменён на EIA API
 4. ML-прогноз интегрирован в скоринг (ml_predict.py)
 5. Консервативная логика determine_signal: фильтры по ML, новостям и уровням
-6. ИСПРАВЛЕНО: EIA Storage — убран недопустимый фасет region=US
-7. ИСПРАВЛЕНО: parse_news — закомментированы недоступные RSS-ленты
 """
 
 import os
@@ -103,8 +101,8 @@ def fetch_prices_yahoo():
         )
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         data = r.json()
-        timestamps = data["chart"]["result"]["timestamp"]
-        quotes = data["chart"]["result"]["indicators"]["quote"]
+        timestamps = data["chart"]["result"][0]["timestamp"]
+        quotes = data["chart"]["result"][0]["indicators"]["quote"][0]
         df = pd.DataFrame({
             "Date": [datetime.fromtimestamp(t) for t in timestamps],
             "Open": quotes["open"],
@@ -134,10 +132,10 @@ def fetch_prices_eia():
         f"https://api.eia.gov/v2/natural-gas/pri/fut/data/"
         f"?api_key={EIA_API_KEY}"
         f"&frequency=daily"
-        f"&data=value"
+        f"&data[0]=value"
         f"&facets[series][]=RNGWHHD"
-        f"&sort[column]=period"
-        f"&sort[direction]=desc"
+        f"&sort[0][column]=period"
+        f"&sort[0][direction]=desc"
         f"&length=730"
     )
 
@@ -337,7 +335,7 @@ def volume_profile(df, lookback=60, num_bins=40):
 
 def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     level_score = 0
-    msg = f"POC: \${vp['poc']:.3f}\n"
+    msg = f"POC: ${vp['poc']:.3f}\n"
     msg += f"Value Area: ${vp['val']:.3f} — ${vp['vah']:.3f}\n"
 
     nearest_sup = None
@@ -347,7 +345,7 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     if sups_below:
         nearest_sup = max(sups_below)
         dist = abs(price - nearest_sup) / price
-        msg += f"🟢 Поддержка: \${nearest_sup:.3f} ({dist*100:.1f}%)\n"
+        msg += f"🟢 Поддержка: ${nearest_sup:.3f} ({dist*100:.1f}%)\n"
         if dist < 0.015:
             level_score += 1
     else:
@@ -357,13 +355,13 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     if ress_above:
         nearest_res = min(ress_above)
         dist = abs(nearest_res - price) / price
-        msg += f"🔴 Сопротивление: \${nearest_res:.3f} ({dist*100:.1f}%)\n"
+        msg += f"🔴 Сопротивление: ${nearest_res:.3f} ({dist*100:.1f}%)\n"
         if dist < 0.015:
             level_score -= 1
     else:
         msg += "🔴 Сопротивление: нет в окне\n"
 
-    msg += f"📐 Pivot: P=${pivots['P']:.3f} R1=${pivots['R1']:.3f} S1=\${pivots['S1']:.3f}\n"
+    msg += f"📐 Pivot: P=${pivots['P']:.3f} R1=${pivots['R1']:.3f} S1=${pivots['S1']:.3f}\n"
 
     if price > vp["poc"]:
         level_score += 1
@@ -375,7 +373,7 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
         level_score -= 1
 
     if vp["hvn"]:
-        msg += f"📊 HVN: {', '.join([f'\${h:.3f}' for h in vp['hvn']])}\n"
+        msg += f"📊 HVN: {', '.join([f'${h:.3f}' for h in vp['hvn']])}\n"
 
     return msg, level_score, nearest_sup, nearest_res
 
@@ -388,11 +386,11 @@ def get_eia_storage():
         logging.info("EIA API key не задан — fallback-значения запасов")
         return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
 
-    # ИСПРАВЛЕНО: убран недопустимый фасет region=US
     attempts = [
         {"facets": "facets[duoarea][]=NUS&facets[process][]=SAV", "label": "duoarea=NUS+process=SAV"},
         {"facets": "facets[process][]=SAV", "label": "process=SAV"},
         {"facets": "facets[duoarea][]=NUS", "label": "duoarea=NUS"},
+        {"facets": "facets[region][]=US", "label": "region=US"},
         {"facets": "", "label": "без facets"},
     ]
 
@@ -404,13 +402,13 @@ def get_eia_storage():
                 f"{base_url}"
                 f"?api_key={EIA_API_KEY}"
                 f"&frequency=weekly"
-                f"&data=value"
+                f"&data[0]=value"
             )
             if attempt["facets"]:
                 url += f"&{attempt['facets']}"
             url += (
-                f"&sort[column]=period"
-                f"&sort[direction]=desc"
+                f"&sort[0][column]=period"
+                f"&sort[0][direction]=desc"
                 f"&length=50"
             )
 
@@ -441,13 +439,13 @@ def get_eia_storage():
 
             if len(us_records) >= 2:
                 us_records.sort(key=lambda r: r.get("period", ""), reverse=True)
-                current = float(us_records["value"])
-                prev = float(us_records["value"])
+                current = float(us_records[0]["value"])
+                prev = float(us_records[1]["value"])
                 build = current - prev
                 logging.info(f"✅ [EIA Storage] {attempt['label']}: текущие={current:.0f} Bcf, закачка={build:.0f} Bcf")
                 return current, build, STORAGE_FORECAST
             elif len(us_records) == 1:
-                current = float(us_records["value"])
+                current = float(us_records[0]["value"])
                 logging.warning(f"[EIA Storage] {attempt['label']}: 1 запись ({current:.0f} Bcf)")
                 return current, LAST_STORAGE_BUILD, STORAGE_FORECAST
 
@@ -490,11 +488,10 @@ NEWS_KEYWORDS = {
 }
 
 def parse_news():
-    # ИСПРАВЛЕНО: закомментированы недоступные RSS-ленты
     feeds = [
-        # "https://www.naturalgasintelligence.com/feed/",  # Недоступен
-        # "https://www.eia.gov/todayinenergy/rss.xml",      # Невалидный XML
-        # "https://oilprice.com/rss/home.rss",             # Невалидный XML
+        "https://www.naturalgasintelligence.com/feed/",
+        "https://www.eia.gov/todayinenergy/rss.xml",
+        "https://oilprice.com/rss/home.rss",
     ]
     titles = []
     cutoff = datetime.now() - timedelta(hours=24)
@@ -545,7 +542,7 @@ def score_news(titles):
         "geopolitics": "🌍 Геополитика",
     }
     msg = f"Скоринг: {total:+d} ({'📈 бычий' if total > 0 else '📉 медвежий' if total < 0 else '➡️ нейтральный'})\n"
-    for cat, score in sorted(category_scores.items(), key=lambda x: abs(x), reverse=True):
+    for cat, score in sorted(category_scores.items(), key=lambda x: abs(x[1]), reverse=True):
         msg += f"{cat_names.get(cat, cat)}: {score:+d} {'📈' if score > 0 else '📉'}\n"
         for m in category_msgs[cat]:
             msg += f"  {m}\n"
@@ -570,9 +567,9 @@ def fetch_powerburn():
                 f"https://api.eia.gov/v2/electricity/rto/fuel-type-data/data/"
                 f"?api_key={EIA_API_KEY}"
                 f"&frequency=hourly"
-                f"&data=value"
-                f"&sort[column]=period"
-                f"&sort[direction]=desc"
+                f"&data[0]=value"
+                f"&sort[0][column]=period"
+                f"&sort[0][direction]=desc"
                 f"&length=500"
             )
             r = eia_get(url, timeout=15)
@@ -580,7 +577,7 @@ def fetch_powerburn():
             if r.status_code == 200:
                 records = r.json().get("response", {}).get("data", [])
                 if records:
-                    latest_period = records.get("period", "")
+                    latest_period = records[0].get("period", "")
                     hour_records = [
                         rec for rec in records
                         if rec.get("period") == latest_period
@@ -725,154 +722,256 @@ def calculate_score(ind, level_score, storage_score, season_score,
 def determine_signal(score, ml_available, news_score, price,
                      support=None, resistance=None):
     """
-    Консервативная логика сигнала
+    Консервативная логика сигнала: приоритет — не потерять, а не заработать.
+    Симметричные фильтры для лонга и шорта.
+
+    Параметры:
+        score        — итоговый скоринг (-15..+15)
+        ml_available — загружен ли ML-модуль
+        news_score   — скоринг новостей (-5..+5)
+        price        — текущая цена
+        support      — ближайший уровень поддержки (или None)
+        resistance   — ближайший уровень сопротивления (или None)
     """
-    # ВРЕМЕННОЕ ИСПРАВЛЕНИЕ: если ML недоступен, не блокируем сигнал полностью
+    # ── Фильтр 1: без ML — не торгуем ──
     if not ml_available:
-        logging.warning("ML недоступен — работаем без ML-скоринга")
-        # Можно дополнительно уменьшить вес других факторов или добавить штраф
-        # score = int(score * 0.7)
+        return "⬜ ВНЕ ПОЗИЦИИ (нет ML — не торгуем)"
 
-    # Логика по скорингу
-    if score >= 5:
-        return "🟢 LONG (сильный бычий сигнал)"
+    # ── Фильтр 2: нейтральные новости — гасим сильные сигналы ──
+    if news_score == 0:
+        if score >= 4:
+            score = 2   # «сильный лонг» → «лонг»
+        elif score <= -4:
+            score = -2  # «сильный шорт» → «шорт»
+
+    # ── Фильтр 3: близость к уровню — не входим против уровня ──
+    # Лонг: не даём, если цена в пределах 0.5% над поддержкой
+    if support and ((price - support) / support) < 0.005:
+        return "⬜ ВНЕ ПОЗИЦИИ (цена вплотную к поддержке — риск ложного пробоя)"
+    # Шорт: не даём, если цена в пределах 0.5% под сопротивлением
+    if resistance and ((resistance - price) / price) < 0.005:
+        return "⬜ ВНЕ ПОЗИЦИИ (цена вплотную к сопротивлению — риск выноса)"
+
+    # ── Основная логика скоринга ──
+    if score >= 4:
+        return "🟢 СИЛЬНЫЙ ЛОНГ"
     elif score >= 2:
-        return "🟡 LONG (умеренный бычий сигнал)"
-    elif score <= -5:
-        return "🔴 SHORT (сильный медвежий сигнал)"
+        return "🟡 ЛОНГ"
+    elif score >= 1:
+        return "⚪ СЛАБЫЙ ЛОНГ"
+    elif score <= -4:
+        return "🔴 СИЛЬНЫЙ ШОРТ"
     elif score <= -2:
-        return "🟠 SHORT (умеренный медвежий сигнал)"
+        return "🟠 ШОРТ"
+    elif score <= -1:
+        return "🔵 СЛАБЫЙ ШОРТ"
     else:
-        return "⬜ ВНЕ ПОЗИЦИИ (недостаточно оснований)"
+        return "⬜ ВНЕ ПОЗИЦИИ"
 
 
-def is_cme_hours():
+# ============================================================
+# МОДУЛЬ 9: TELEGRAM
+# ============================================================
+
+def send_telegram(text, is_change_alert=False):
     now = datetime.now(MSK)
-    return CME_START_HOUR_MSK <= now.hour < CME_END_HOUR_MSK
-
-
-def send_telegram(message, is_change_alert=False):
+    is_cme_hours = CME_START_HOUR_MSK <= now.hour < CME_END_HOUR_MSK
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning("Telegram не настроен — сообщение не отправлено")
+        print("[DEBUG] Telegram отключён — нет токена/chat_id")
         return False
-
-    # Проверка CME-часов
-    if not is_cme_hours() and not is_change_alert:
-        logging.info("[Telegram] Вне CME-часов — сообщение залогировано, но не отправлено")
+    if not is_cme_hours and not is_change_alert:
+        logging.info(f"Вне CME-часов — Telegram не отправляется: {text[:100]}")
+        print("[Вне CME-часов] Сигнал залогирован, но не отправлен в Telegram")
         return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown",
-    }
+    full_text = ("🚨 *СМЕНА СИГНАЛА* 🚨\n\n" + text) if is_change_alert else text
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code == 200:
-            logging.info("✅ Telegram: сообщение отправлено")
-            return True
-        else:
-            logging.error(f"❌ Telegram: ошибка API {r.status_code} — {r.text}")
-            return False
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": full_text, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+        if r.status_code == 200: return True
+        logging.error(f"Telegram error: {r.status_code} {r.text}")
+        return False
     except Exception as e:
-        logging.error(f"❌ Telegram: ошибка отправки — {e}")
+        logging.error(f"Telegram send error: {e}")
         return False
 
+def load_last_signal():
+    try:
+        with open(LAST_SIGNAL_FILE, "r") as f:
+            data = json.load(f)
+            return data.get("signal", ""), data.get("score", 0), data.get("price", 0), data.get("timestamp", "")
+    except Exception:
+        return "", 0, 0, ""
+
+def save_last_signal(signal, score, price):
+    try:
+        with open(LAST_SIGNAL_FILE, "w") as f:
+            json.dump({"signal": signal, "score": score, "price": price,
+                        "timestamp": datetime.now().isoformat()}, f)
+    except Exception:
+        pass
+
+def should_send_signal(signal, score, price, prev_signal, prev_score, prev_timestamp, is_cme):
+    now = datetime.now()
+    if prev_signal and prev_signal != signal:
+        return True, "change"
+    if not prev_signal:
+        return True, "first_run_force"
+    if abs(score - prev_score) >= SCORE_CHANGE_THRESHOLD:
+        return True, f"score_change ({prev_score:+d} → {score:+d})"
+    if is_cme and prev_timestamp:
+        try:
+            last_dt = datetime.fromisoformat(prev_timestamp)
+            if (now - last_dt).total_seconds() >= REGULAR_INTERVAL_HOURS * 3600:
+                return True, "regular_interval"
+        except Exception:
+            return True, "regular_interval_no_timestamp"
+    elif is_cme and not prev_timestamp:
+        return True, "regular_no_timestamp"
+    return False, "no_change"
+
+# ============================================================
+# ОСНОВНОЙ ЦИКЛ
+# ============================================================
 
 def main():
-    logging.info("--- Запуск системы сигналов Henry Hub ---")
+    now = datetime.now(MSK)
+    logging.info(f"=== Запуск цикла {now.strftime('%Y-%m-%d %H:%M:%S')} МСК ===")
 
-    # Загрузка данных
     try:
         df, source_label = fetch_prices()
+        if len(df) < 50:
+            logging.error("Недостаточно данных для анализа")
+            return
     except Exception as e:
         logging.error(f"Критическая ошибка загрузки цен: {e}")
         return
 
-    # Индикаторы
     ind = calc_indicators(df)
-    season_score = seasonality_score(ind["price"])
-
-    # Уровни
     support_lvls, resistance_lvls = find_swing_levels(df)
     pivots = calc_pivots(df)
-    vp = volume_profile(df)
-    levels_msg, level_score, nearest_sup, nearest_res = format_levels_message(
-        ind["price"], vp, support_lvls, resistance_lvls, pivots
-    )
+    vp = volume_profile(df, lookback=60, num_bins=40)
+    level_msg, level_score, nearest_sup, nearest_res = format_levels_message(
+        ind["price"], vp, support_lvls, resistance_lvls, pivots)
 
-    # Запасы EIA
     storage_bcf, build, forecast = get_eia_storage()
     storage_score, storage_msg = score_storage(storage_bcf, build, forecast)
 
-    # Новости
-    titles = parse_news()
-    news_score, news_msg = score_news(titles)
+    season_score = seasonality_score(now.month)
+    news_titles = parse_news()
+    news_score, news_msg = score_news(news_titles)
 
-    # Powerburn
-    pb = fetch_powerburn()
-    pb_score, pb_msg = score_powerburn(pb)
+    pb_data = fetch_powerburn()
+    pb_score, pb_msg = score_powerburn(pb_data)
 
     # ML-прогноз
-    ml_score = 0
     if ML_AVAILABLE:
-        try:
-            ml_score = get_ml_prediction(df)
-        except Exception as e:
-            logging.error(f"Ошибка ML-прогноза: {e}")
+        ml_result = get_ml_prediction(df)
+        ml_score = ml_result["ml_score"] if ml_result else 0
+        ml_msg = ml_result["message"] if ml_result else "🤖 ML: модель недоступна"
+    else:
+        ml_score = 0
+        ml_msg = "🤖 ML: модуль не загружен"
 
-    # Скоринг
     total_score = calculate_score(
         ind, level_score, storage_score, season_score,
         news_score, pb_score, ml_score
     )
 
-    # Сигнал
-    signal = determine_signal(total_score, ML_AVAILABLE, news_score, ind["price"],
-                              nearest_sup, nearest_res)
-
-    # Формирование сообщения
-    full_msg = (
-        f"📊 Henry Hub Natural Gas — Сигнал\n\n"
-        f"Цена: \${ind['price']:.3f}\n"
-        f"Скоринг: {total_score}/15\n"
-        f"Сигнал: {signal}\n\n"
-        f"--- Источники ---\n"
-        f"Основной: {source_label}\n\n"
-        f"--- Индикаторы ---\n"
-        f"RSI: {ind['rsi']:.1f} | MA50: ${ind['ma50']:.3f} | MA200: ${ind['ma200']:.3f}\n"
-        f"BB: ${ind['bb_lower']:.3f} — ${ind['bb_upper']:.3f}\n"
-        f"MACD Hist: {ind['macd_hist']:.3f}\n"
-        f"ATR: {ind['atr']:.3f}\n\n"
-        f"--- Уровни ---\n{levels_msg}\n"
-        f"--- Запасы ---\n{storage_msg}\n"
-        f"--- Новости ---\n{news_msg}\n"
-        f"--- Powerburn ---\n{pb_msg}\n"
+    # ── Консервативная логика сигнала ──
+    signal = determine_signal(
+        score=total_score,
+        ml_available=ML_AVAILABLE,
+        news_score=news_score,
+        price=ind["price"],
+        support=nearest_sup,
+        resistance=nearest_res,
     )
 
-    if ML_AVAILABLE:
-        full_msg += f"--- ML-прогноз ---\nML Score: {ml_score:+d}\n"
+    price, atr = ind["price"], ind["atr"]
+
+    is_long = "ЛОНГ" in signal
+    is_short = "ШОРТ" in signal
+
+    if is_long:
+        sl, tp1, tp2 = price - 1.5 * atr, price + 2 * atr, price + 4 * atr
+        if nearest_sup and sl > nearest_sup: sl = nearest_sup - 0.02
+    elif is_short:
+        sl, tp1, tp2 = price + 1.5 * atr, price - 2 * atr, price - 4 * atr
+        if nearest_res and sl < nearest_res: sl = nearest_res + 0.02
     else:
-        full_msg += f"--- ML-прогноз ---\nML недоступен — работает без ML-скоринга\n"
+        sl, tp1, tp2 = price - 1.5 * atr, price + 2 * atr, price + 4 * atr
 
-    logging.info(full_msg)
+    risk = abs(price - sl)
+    rr1 = abs(tp1 - price) / risk if risk > 0 else 0
 
-    # Отправка в Telegram
-    send_telegram(full_msg)
+    prev_signal, prev_score, prev_price, prev_timestamp = load_last_signal()
+    is_cme = CME_START_HOUR_MSK <= now.hour < CME_END_HOUR_MSK
+    should_send, send_reason = should_send_signal(
+        signal, total_score, price, prev_signal, prev_score, prev_timestamp, is_cme)
 
-    # Сохранение последнего сигнала (опционально)
-    with open(LAST_SIGNAL_FILE, "w") as f:
-        json.dump({
-            "timestamp": datetime.now(MSK).isoformat(),
-            "price": ind["price"],
-            "score": total_score,
-            "signal": signal,
-        }, f)
+    log_line = (f"{signal} | score={total_score} | price=${price:.3f} | "
+                f"prev={prev_signal} score={prev_score} | "
+                f"send={should_send} ({send_reason})")
+    logging.info(log_line)
+    print(log_line)
 
-    logging.info("--- Завершение работы системы сигналов ---")
+    save_last_signal(signal, total_score, price)
+
+    # ── Формирование сообщения ──
+    msg = f"{signal}\nScore: {total_score}/15\nЦена: ${price:.3f}\n"
+    eia_spot = df["EIA_Spot"].iloc[-1] if "EIA_Spot" in df.columns else np.nan
+    if not np.isnan(eia_spot):
+        msg += f"EIA спот: ${eia_spot:.3f}\n"
+    if is_long or is_short:
+        msg += f"SL: ${sl:.3f}\nTP1: ${tp1:.3f} | TP2: ${tp2:.3f}\nR/R: {rr1:.2f}\n"
+
+    msg += "━━━━ ИСТОЧНИКИ ━━━━\n"
+    msg += f"Основной: {source_label}\n"
+    if "Open" in df.columns and not df["Open"].isna().all():
+        msg += "✅ Yahoo Finance (NG=F): данные загружены\n"
+    else:
+        msg += "❌ Yahoo Finance: данные недоступны\n"
+    if "EIA_Spot" in df.columns and not df["EIA_Spot"].isna().all():
+        msg += "✅ EIA API (Henry Hub спот): данные загружены\n"
+    else:
+        msg += "❌ EIA API: данные недоступны\n"
+
+    msg += "━━━━ ИНДИКАТОРЫ ━━━━\n"
+    msg += f"RSI: {ind['rsi']:.1f} | MA50: ${ind['ma50']:.3f} | MA200: ${ind['ma200']:.3f}\n"
+    msg += f"ATR: ${ind['atr']:.3f}\n"
+    msg += "━━━━ ЗАПАСЫ EIA ━━━━\n" + storage_msg
+    msg += "━━━━ УРОВНИ ━━━━\n" + level_msg
+    msg += "━━━━ POWERBURN ━━━━\n" + pb_msg
+    msg += "━━━━ НОВОСТИ ━━━━\n" + news_msg
+    msg += "━━━━ ML-ПРОГНОЗ ━━━━\n" + ml_msg + "\n"
+
+    if should_send:
+        is_change_alert = (send_reason == "change")
+        success = send_telegram(msg, is_change_alert=is_change_alert)
+        print(f"✅ Отправлено в Telegram ({send_reason})" if success else f"❌ Не отправлено ({send_reason})")
+    else:
+        print(f"⏸ Не отправлено — нет изменений ({send_reason})")
+    print(f"\n--- Полное сообщение ---\n{msg}")
 
 
 if __name__ == "__main__":
-    main()
+    mode = sys.argv[1] if len(sys.argv) > 1 else "--once"
+    if mode == "--once":
+        main()
+    elif mode == "--test":
+        TELEGRAM_BOT_TOKEN = ""
+        main()
+    elif mode == "--loop":
+        while True:
+            try:
+                main()
+            except Exception as e:
+                logging.error(f"Цикл error: {e}")
+            time.sleep(3600)
+    else:
+        print(f"Неизвестный режим: {mode}")
+        print("Использование: python henry_hub_signals.py [--once|--test|--loop]")
 
