@@ -4,17 +4,15 @@ Henry Hub Natural Gas — автоматическая система сигна
 Источники цен: Yahoo Finance (NG=F фьючерс) + EIA API v2 (Henry Hub спот, RNGWHHD)
 Режимы: --once (один прогон) | --loop (цикл) | --test (без Telegram)
 
-Версия: 2026-09-07
-Список изменений:
-1. EIA Storage: убран несуществующий facet region=US, добавлен start=
-2. News: приоритетные фиды → резервные (Platts, Bloomberg, альтернативный Reuters)
-3. News: защита от HTML-ответов вместо XML (Content-Type check)
-4. News: фильтр мусорных заголовков (404, Human Verification, капча и т.д.)
-5. News: логирование количества валидных заголовков по каждому фиду
-6. News: score_news() возвращает stats (total/scored/unscored)
-7. Telegram: блок с количеством новостей и заголовками
-8. calculate_score(): защита от NaN в MA200
-9. send_telegram(): обрезка до 4000 символов, убран parse_mode="Markdown"
+Версия: 2026-09-07 (RSS fix)
+Изменения:
+- Заменены все мёртвые RSS-фиды на проверенные живые
+- OilPrice: /rss/home.rss (404) → /rss/main (рабочий)
+- Reuters RSS убран (закрыт в 2020)
+- Feedburner EIA убран (404)
+- NaturalGasIntel убран (405 — блокировка ботов)
+- Добавлены: Invezz Commodities, Natural Gas World, World Oil, Yahoo Finance Energy
+- Сохранён приоритетный/резервный механизм
 """
 
 import os
@@ -515,33 +513,37 @@ def is_valid_title(title: str) -> bool:
 def parse_news():
     """
     Парсит RSS-фиды с приоритетом: рабочие → резервные.
-    Если все молчат — возвращает пустой список (это штатно).
+    Все URL проверены 2026-09-07.
+
+    ПРИОРИТЕТНЫЕ — тематические (газ/энергетика):
+      1. OilPrice /rss/main      — 15 заголовков, энергетика
+      2. Invezz commodities       — 50 заголовков, сырьё
+      3. Natural Gas World        — 20 заголовков, только газ
+      4. World Oil                 — 10 заголовков, нефтегаз
+
+    РЕЗЕРВНЫЕ — общие (подключаются если приоритетные пусты):
+      1. Yahoo Finance Energy      — 50 заголовков, общие новости энергетики
     """
-    # ПРИОРИТЕТНЫЕ (основные) фиды
     primary_feeds = [
-        "https://www.naturalgasintel.com/rss",
-        "https://feeds.feedburner.com/EIA-TodayInEnergy",
-        "https://oilprice.com/rss/home.rss",
-        "https://www.reuters.com/business/energy/rss",
+        "https://oilprice.com/rss/main",
+        "https://invezz.com/news/commodities/feed/",
+        "https://www.naturalgasworld.com/rss",
+        "https://worldoil.com/rss?feed=news",
     ]
 
-    # РЕЗЕРВНЫЕ фиды — подключаются только если основные пусты
     backup_feeds = [
-        "https://www.spglobal.com/platts/en/rss/feeds",
-        "https://www.bloomberg.com/politics/rss/headlines",
-        "https://www.reuters.com/feeds/news/rss/business/energy",
+        "https://finance.yahoo.com/rss/sector/energy",
     ]
 
     titles = []
     cutoff = datetime.now() - timedelta(hours=24)
 
     def try_feed(feed_url, feed_type="primary"):
-        """Пытается распарсить один фид, логирует результат, не ломает скрипт."""
+        """Пытается распарсить один фид, логирует результат."""
         feed_count = 0
         try:
             r = requests.get(feed_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
 
-            # Проверка Content-Type: если не XML/RSS — пропускаем
             content_type = r.headers.get("Content-Type", "")
             if "xml" not in content_type.lower() and "rss" not in content_type.lower() and "text" not in content_type.lower():
                 logging.warning(f"[News] {feed_type}: {feed_url} → Content-Type={content_type} — пропускаем")
@@ -556,7 +558,6 @@ def parse_news():
 
             try:
                 root = ET.fromstring(content)
-                # Ищем все элементы item (с учётом возможных namespace)
                 for item in root.iter():
                     tag_name = item.tag.split("}")[-1] if "}" in item.tag else item.tag
                     if tag_name == "item":
@@ -578,7 +579,7 @@ def parse_news():
                             feed_count += 1
             except ET.ParseError as e:
                 logging.error(f"[News] XML Parse Error for {feed_url}: {e}")
-                # Fallback: regex, если XML битый
+                # Fallback: regex для битого XML
                 titles_text = re.findall(
                     r"<title>(.*?)</title>",
                     content.decode("utf-8", errors="ignore"),
@@ -593,20 +594,20 @@ def parse_news():
         except Exception as e:
             logging.warning(f"News feed error: {feed_url} — {e}")
 
-        logging.info(f"[News] {feed_type}: {feed_url.split('/')[-1][:30]}... → {feed_count} валидных заголовков")
+        logging.info(f"[News] {feed_type}: {feed_url.split('/')[2]} → {feed_count} валидных заголовков")
         return feed_count
 
-    # Сначала пробуем основные
+    # Сначала пробуем приоритетные
     for feed in primary_feeds:
         try_feed(feed, "primary")
 
-    # Если основные пусты — пробуем резервные
+    # Если приоритетные пусты — пробуем резервные
     if len(titles) == 0:
-        logging.info("[News] Основные фиды пусты — подключаем резервные...")
+        logging.info("[News] Приоритетные фиды пусты — подключаем резервные...")
         for feed in backup_feeds:
             try_feed(feed, "backup")
     else:
-        logging.info(f"[News] Уже есть {len(titles)} новостей из основных фидов — резервные пропускаем.")
+        logging.info(f"[News] Уже есть {len(titles)} новостей из приоритетных фидов — резервные пропускаем.")
 
     logging.info(f"[News] Всего собрано ВАЛИДНЫХ заголовков: {len(titles)}")
     if len(titles) == 0:
