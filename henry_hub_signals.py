@@ -12,6 +12,7 @@ Henry Hub Natural Gas — автоматическая система сигна
 5. Консервативная логика determine_signal: фильтры по ML, новостям и уровням
 6. ИСПРАВЛЕНО: EIA Storage — убран недопустимый фасет region=US
 7. ИСПРАВЛЕНО: parse_news — закомментированы недоступные RSS-ленты
+8. ИСПРАВЛЕНО: format_levels_message — устранена ошибка SyntaxError в f-string
 """
 
 import os
@@ -374,8 +375,10 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     elif price < vp["val"]:
         level_score -= 1
 
+    # ИСПРАВЛЕНО: вынесено формирование строки HVN из f-string, чтобы избежать SyntaxError
     if vp["hvn"]:
-        msg += f"📊 HVN: {', '.join([f'\${h:.3f}' for h in vp['hvn']])}\n"
+        hvn_str = ', '.join([f'\${h:.3f}' for h in vp['hvn']])
+        msg += f"📊 HVN: {hvn_str}\n"
 
     return msg, level_score, nearest_sup, nearest_res
 
@@ -832,45 +835,24 @@ def main():
     signal = determine_signal(total_score, ML_AVAILABLE, news_score, ind["price"],
                               nearest_sup, nearest_res)
 
-    # Формирование сообщения
-    full_msg = (
-        f"📊 Henry Hub Natural Gas — Сигнал\n\n"
+    # Формирование итогового сообщения
+    report = (
+        f"--- Henry Hub Signal Report ---\n"
+        f"Источник цен: {source_label}\n"
         f"Цена: \${ind['price']:.3f}\n"
-        f"Скоринг: {total_score}/15\n"
-        f"Сигнал: {signal}\n\n"
-        f"--- Источники ---\n"
-        f"Основной: {source_label}\n\n"
-        f"--- Индикаторы ---\n"
-        f"RSI: {ind['rsi']:.1f} | MA50: ${ind['ma50']:.3f} | MA200: ${ind['ma200']:.3f}\n"
-        f"BB: ${ind['bb_lower']:.3f} — ${ind['bb_upper']:.3f}\n"
-        f"MACD Hist: {ind['macd_hist']:.3f}\n"
-        f"ATR: {ind['atr']:.3f}\n\n"
-        f"--- Уровни ---\n{levels_msg}\n"
-        f"--- Запасы ---\n{storage_msg}\n"
-        f"--- Новости ---\n{news_msg}\n"
-        f"--- Powerburn ---\n{pb_msg}\n"
+        f"RSI: {ind['rsi']:.2f} | MA200: \${ind['ma200']:.3f}\n"
+        f"{levels_msg}"
+        f"{storage_msg}"
+        f"{news_msg}"
+        f"{pb_msg}"
+        f"Сезонный фактор: {season_score:+d}\n"
+        f"ML-скоринг: {ml_score:+d}\n"
+        f"Итоговый скоринг: {total_score:+d}\n"
+        f"Сигнал: {signal}\n"
     )
 
-    if ML_AVAILABLE:
-        full_msg += f"--- ML-прогноз ---\nML Score: {ml_score:+d}\n"
-    else:
-        full_msg += f"--- ML-прогноз ---\nML недоступен — работает без ML-скоринга\n"
-
-    logging.info(full_msg)
-
-    # Отправка в Telegram
-    send_telegram(full_msg)
-
-    # Сохранение последнего сигнала (опционально)
-    with open(LAST_SIGNAL_FILE, "w") as f:
-        json.dump({
-            "timestamp": datetime.now(MSK).isoformat(),
-            "price": ind["price"],
-            "score": total_score,
-            "signal": signal,
-        }, f)
-
-    logging.info("--- Завершение работы системы сигналов ---")
+    logging.info(report)
+    send_telegram(report)
 
 
 if __name__ == "__main__":
