@@ -4,15 +4,17 @@ Henry Hub Natural Gas — автоматическая система сигна
 Источники цен: Yahoo Finance (NG=F фьючерс) + EIA API v2 (Henry Hub спот, RNGWHHD)
 Режимы: --once (один прогон) | --loop (цикл) | --test (без Telegram)
 
-ИСПРАВЛЕНО:
+Версия: 2026-09-07
+Список изменений:
 1. EIA Storage: убран несуществующий facet region=US, добавлен start=
-2. News feeds: заменены мёртвые фиды, добавлен regex-fallback для битого XML
-3. Фильтр мусорных заголовков (404, Human Verification, капча и т.д.)
-4. Логирование количества заголовков по каждому фиду
-5. В Telegram — блок с количеством новостей и заголовками
-6. Защита от NaN в MA200
-7. Обрезка длинных сообщений (лимит Telegram 4096 символов)
-8. Убран parse_mode="Markdown" (спецсимволы в новостях ломали разметку)
+2. News: приоритетные фиды → резервные (Platts, Bloomberg, альтернативный Reuters)
+3. News: защита от HTML-ответов вместо XML (Content-Type check)
+4. News: фильтр мусорных заголовков (404, Human Verification, капча и т.д.)
+5. News: логирование количества валидных заголовков по каждому фиду
+6. News: score_news() возвращает stats (total/scored/unscored)
+7. Telegram: блок с количеством новостей и заголовками
+8. calculate_score(): защита от NaN в MA200
+9. send_telegram(): обрезка до 4000 символов, убран parse_mode="Markdown"
 """
 
 import os
@@ -490,13 +492,14 @@ NEWS_KEYWORDS = {
     "geopolitics": [("sanctions",2,"bull"),("ukraine",2,"bull"),("hormuz",2,"bull"),("middle east tension",2,"bull"),("russia gas",2,"bull"),("trade war",-1,"bear")],
 }
 
-# Стоп-слова для фильтрации мусорных заголовков (404, капчи, заглушки)
+# Стоп-слова для фильтрации мусорных заголовков
 JUNK_STOPWORDS = [
     "human verification", "captcha", "verify your identity",
     "error 404", "not found", "page not found", "access denied",
     "internal server error", "500 error", "maintenance",
     "site is under maintenance", "coming soon", "under construction",
     "xml parsing", "rss error", "forbidden", "403 error",
+    "temporarily unavailable", "service unavailable", "rate limit exceeded",
 ]
 
 def is_valid_title(title: str) -> bool:
@@ -511,64 +514,99 @@ def is_valid_title(title: str) -> bool:
 
 def parse_news():
     """
-    Парсит RSS-фиды, фильтрует мусор и возвращает список заголовков.
-    Логирует количество валидных заголовков по каждому фиду.
+    Парсит RSS-фиды с приоритетом: рабочие → резервные.
+    Если все молчат — возвращает пустой список (это штатно).
     """
-    feeds = [
+    # ПРИОРИТЕТНЫЕ (основные) фиды
+    primary_feeds = [
         "https://www.naturalgasintel.com/rss",
         "https://feeds.feedburner.com/EIA-TodayInEnergy",
         "https://oilprice.com/rss/home.rss",
         "https://www.reuters.com/business/energy/rss",
     ]
+
+    # РЕЗЕРВНЫЕ фиды — подключаются только если основные пусты
+    backup_feeds = [
+        "https://www.spglobal.com/platts/en/rss/feeds",
+        "https://www.bloomberg.com/politics/rss/headlines",
+        "https://www.reuters.com/feeds/news/rss/business/energy",
+    ]
+
     titles = []
     cutoff = datetime.now() - timedelta(hours=24)
 
-    for feed in feeds:
+    def try_feed(feed_url, feed_type="primary"):
+        """Пытается распарсить один фид, логирует результат, не ломает скрипт."""
         feed_count = 0
         try:
-            r = requests.get(feed, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            r = requests.get(feed_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+
+            # Проверка Content-Type: если не XML/RSS — пропускаем
+            content_type = r.headers.get("Content-Type", "")
+            if "xml" not in content_type.lower() and "rss" not in content_type.lower() and "text" not in content_type.lower():
+                logging.warning(f"[News] {feed_type}: {feed_url} → Content-Type={content_type} — пропускаем")
+                return 0
+
             if r.status_code != 200:
-                logging.warning(f"[News] {feed} returned HTTP {r.status_code} — skipping")
-                continue
+                logging.warning(f"[News] {feed_type}: {feed_url} HTTP {r.status_code} — пропускаем")
+                return 0
 
             content = r.content
             content = content.replace(b"\x00", b"").replace(b"\x0b", b"")
 
             try:
                 root = ET.fromstring(content)
-                for item in root.findall(".//item"):
-                    title = item.findtext("title", "")
-                    pub_str = item.findtext("pubDate", "")
+                # Ищем все элементы item (с учётом возможных namespace)
+                for item in root.iter():
+                    tag_name = item.tag.split("}")[-1] if "}" in item.tag else item.tag
+                    if tag_name == "item":
+                        title = item.findtext("title", "")
+                        pub_str = item.findtext("pubDate", "")
 
-                    if not is_valid_title(title):
-                        continue
+                        if not is_valid_title(title):
+                            continue
 
-                    pub_date = None
-                    if pub_str:
-                        try:
-                            pub_date = parsedate_to_datetime(pub_str).replace(tzinfo=None)
-                        except Exception:
-                            pub_date = None
+                        pub_date = None
+                        if pub_str:
+                            try:
+                                pub_date = parsedate_to_datetime(pub_str).replace(tzinfo=None)
+                            except Exception:
+                                pub_date = None
 
-                    if title and (pub_date is None or pub_date >= cutoff):
-                        titles.append(title)
-                        feed_count += 1
-            except ET.ParseError:
+                        if title and (pub_date is None or pub_date >= cutoff):
+                            titles.append(title)
+                            feed_count += 1
+            except ET.ParseError as e:
+                logging.error(f"[News] XML Parse Error for {feed_url}: {e}")
+                # Fallback: regex, если XML битый
                 titles_text = re.findall(
                     r"<title>(.*?)</title>",
                     content.decode("utf-8", errors="ignore"),
                     re.DOTALL,
                 )
                 for t in titles_text[:5]:
-                    if is_valid_title(t):
-                        titles.append(t)
+                    clean_t = t.strip()
+                    if is_valid_title(clean_t):
+                        titles.append(clean_t)
                         feed_count += 1
-                continue
 
         except Exception as e:
-            logging.warning(f"News feed error: {feed} — {e}")
+            logging.warning(f"News feed error: {feed_url} — {e}")
 
-        logging.info(f"[News] {feed}: {feed_count} валидных заголовков")
+        logging.info(f"[News] {feed_type}: {feed_url.split('/')[-1][:30]}... → {feed_count} валидных заголовков")
+        return feed_count
+
+    # Сначала пробуем основные
+    for feed in primary_feeds:
+        try_feed(feed, "primary")
+
+    # Если основные пусты — пробуем резервные
+    if len(titles) == 0:
+        logging.info("[News] Основные фиды пусты — подключаем резервные...")
+        for feed in backup_feeds:
+            try_feed(feed, "backup")
+    else:
+        logging.info(f"[News] Уже есть {len(titles)} новостей из основных фидов — резервные пропускаем.")
 
     logging.info(f"[News] Всего собрано ВАЛИДНЫХ заголовков: {len(titles)}")
     if len(titles) == 0:
