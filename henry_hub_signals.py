@@ -3,13 +3,6 @@ Henry Hub Natural Gas — автоматическая система сигна
 Анализ: техника + уровни + Volume Profile + запасы EIA + новости + Powerburn + ML
 Источники цен: Yahoo Finance (NG=F фьючерс) + EIA API v2 (Henry Hub спот, RNGWHHD)
 Режимы: --once (один прогон) | --loop (цикл) | --test (без Telegram)
-
-ИСПРАВЛЕНО:
-1. requests кодирует [] в %5B/%5D — PreparedRequest с ручным URL
-2. Date mismatch между Yahoo (21:00) и EIA (00:00) — .normalize() перед join
-3. Powerburn: парсинг celsiusenergy.net не работал (JS-рендеринг) — заменён на EIA API
-4. ML-прогноз интегрирован в скоринг (ml_predict.py)
-5. Консервативная логика determine_signal: фильтры по ML, новостям и уровням
 """
 
 import os
@@ -22,7 +15,6 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import quote
 
 import requests
 import pandas as pd
@@ -386,15 +378,17 @@ def get_eia_storage():
         logging.info("EIA API key не задан — fallback-значения запасов")
         return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
 
+    # ИСПРАВЛЕНО: убран несуществующий facet region=US
+    # ИСПРАВЛЕНО: добавлен параметр start= для гарантии возврата нескольких недель
     attempts = [
         {"facets": "facets[duoarea][]=NUS&facets[process][]=SAV", "label": "duoarea=NUS+process=SAV"},
         {"facets": "facets[process][]=SAV", "label": "process=SAV"},
         {"facets": "facets[duoarea][]=NUS", "label": "duoarea=NUS"},
-        {"facets": "facets[region][]=US", "label": "region=US"},
         {"facets": "", "label": "без facets"},
     ]
 
     base_url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
+    start_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
 
     for attempt in attempts:
         try:
@@ -403,6 +397,7 @@ def get_eia_storage():
                 f"?api_key={EIA_API_KEY}"
                 f"&frequency=weekly"
                 f"&data[0]=value"
+                f"&start={start_date}"
             )
             if attempt["facets"]:
                 url += f"&{attempt['facets']}"
@@ -488,17 +483,35 @@ NEWS_KEYWORDS = {
 }
 
 def parse_news():
+    # ИСПРАВЛЕНО: заменены неработающие/мёртвые фиды
+    # ИСПРАВЛЕНО: добавлен tolerant-парсинг с regex-fallback для битого XML
     feeds = [
-        "https://www.naturalgasintelligence.com/feed/",
-        "https://www.eia.gov/todayinenergy/rss.xml",
+        "https://www.naturalgasintel.com/rss",
+        "https://feeds.feedburner.com/EIA-TodayInEnergy",
         "https://oilprice.com/rss/home.rss",
+        "https://www.reuters.com/business/energy/rss",
     ]
     titles = []
     cutoff = datetime.now() - timedelta(hours=24)
+
     for feed in feeds:
         try:
             r = requests.get(feed, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            root = ET.fromstring(r.content)
+            content = r.content
+            # Удаляем BOM и невалидные XML-символы
+            content = content.replace(b"\x00", b"").replace(b"\x0b", b"")
+            try:
+                root = ET.fromstring(content)
+            except ET.ParseError:
+                # Fallback: regex-извлечение <title>...</title>
+                titles_text = re.findall(
+                    r"<title>(.*?)</title>",
+                    content.decode("utf-8", errors="ignore"),
+                    re.DOTALL,
+                )
+                titles.extend(titles_text[:5])
+                continue
+
             for item in root.findall(".//item"):
                 title = item.findtext("title", "")
                 pub_str = item.findtext("pubDate", "")
@@ -512,6 +525,7 @@ def parse_news():
                     titles.append(title)
         except Exception as e:
             logging.warning(f"News feed error: {feed} — {e}")
+
     return titles
 
 def score_news(titles):
@@ -974,4 +988,3 @@ if __name__ == "__main__":
     else:
         print(f"Неизвестный режим: {mode}")
         print("Использование: python henry_hub_signals.py [--once|--test|--loop]")
-
