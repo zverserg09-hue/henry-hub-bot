@@ -7,7 +7,12 @@ Henry Hub Natural Gas — автоматическая система сигна
 ИСПРАВЛЕНО:
 1. EIA Storage: убран несуществующий facet region=US, добавлен start=
 2. News feeds: заменены мёртвые фиды, добавлен regex-fallback для битого XML
-3. В Telegram-сообщение добавлен блок с количеством новостей и заголовками
+3. Фильтр мусорных заголовков (404, Human Verification, капча и т.д.)
+4. Логирование количества заголовков по каждому фиду
+5. В Telegram — блок с количеством новостей и заголовками
+6. Защита от NaN в MA200
+7. Обрезка длинных сообщений (лимит Telegram 4096 символов)
+8. Убран parse_mode="Markdown" (спецсимволы в новостях ломали разметку)
 """
 
 import os
@@ -485,10 +490,29 @@ NEWS_KEYWORDS = {
     "geopolitics": [("sanctions",2,"bull"),("ukraine",2,"bull"),("hormuz",2,"bull"),("middle east tension",2,"bull"),("russia gas",2,"bull"),("trade war",-1,"bear")],
 }
 
+# Стоп-слова для фильтрации мусорных заголовков (404, капчи, заглушки)
+JUNK_STOPWORDS = [
+    "human verification", "captcha", "verify your identity",
+    "error 404", "not found", "page not found", "access denied",
+    "internal server error", "500 error", "maintenance",
+    "site is under maintenance", "coming soon", "under construction",
+    "xml parsing", "rss error", "forbidden", "403 error",
+]
+
+def is_valid_title(title: str) -> bool:
+    """Возвращает False, если заголовок — мусор (ошибка, капча, заглушка)."""
+    if not title or len(title.strip()) < 5:
+        return False
+    t_lower = title.lower()
+    for word in JUNK_STOPWORDS:
+        if word in t_lower:
+            return False
+    return True
+
 def parse_news():
     """
-    Парсит RSS-фиды, возвращает список заголовков.
-    Логирует количество и источник каждого фида.
+    Парсит RSS-фиды, фильтрует мусор и возвращает список заголовков.
+    Логирует количество валидных заголовков по каждому фиду.
     """
     feeds = [
         "https://www.naturalgasintel.com/rss",
@@ -503,19 +527,29 @@ def parse_news():
         feed_count = 0
         try:
             r = requests.get(feed, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                logging.warning(f"[News] {feed} returned HTTP {r.status_code} — skipping")
+                continue
+
             content = r.content
             content = content.replace(b"\x00", b"").replace(b"\x0b", b"")
+
             try:
                 root = ET.fromstring(content)
                 for item in root.findall(".//item"):
                     title = item.findtext("title", "")
                     pub_str = item.findtext("pubDate", "")
+
+                    if not is_valid_title(title):
+                        continue
+
                     pub_date = None
                     if pub_str:
                         try:
                             pub_date = parsedate_to_datetime(pub_str).replace(tzinfo=None)
                         except Exception:
                             pub_date = None
+
                     if title and (pub_date is None or pub_date >= cutoff):
                         titles.append(title)
                         feed_count += 1
@@ -526,16 +560,17 @@ def parse_news():
                     re.DOTALL,
                 )
                 for t in titles_text[:5]:
-                    titles.append(t)
-                    feed_count += 1
+                    if is_valid_title(t):
+                        titles.append(t)
+                        feed_count += 1
                 continue
 
         except Exception as e:
             logging.warning(f"News feed error: {feed} — {e}")
 
-        logging.info(f"[News] {feed}: {feed_count} заголовков")
+        logging.info(f"[News] {feed}: {feed_count} валидных заголовков")
 
-    logging.info(f"[News] Всего собрано заголовков: {len(titles)}")
+    logging.info(f"[News] Всего собрано ВАЛИДНЫХ заголовков: {len(titles)}")
     if len(titles) == 0:
         logging.error("[News] КРИТИЧНО: Новости не получены ни из одного источника!")
     else:
@@ -548,7 +583,6 @@ def score_news(titles):
     """
     Скоринг новостей по ключевым словам.
     Возвращает: total_score, msg, stats
-    stats — словарь с количеством заголовков и списком необработанных.
     """
     category_scores = {}
     category_msgs = {}
@@ -574,7 +608,6 @@ def score_news(titles):
         category_scores[cat] = max(-5, min(5, category_scores[cat]))
     total = max(-5, min(5, sum(category_scores.values())))
 
-    # Нескорингованные заголовки (не попали ни в одну категорию)
     unscored = [t for t in titles if t not in scored_titles]
 
     cat_names = {
@@ -591,7 +624,6 @@ def score_news(titles):
         for m in category_msgs[cat]:
             msg += f"  {m}\n"
 
-    # Топ-3 несгорированных заголовка
     if unscored:
         msg += f"📄 Без скоринга ({len(unscored)}):\n"
         for t in unscored[:3]:
@@ -611,11 +643,6 @@ def score_news(titles):
 # ============================================================
 
 def fetch_powerburn():
-    """
-    Получает данные о powerburn и генерации через EIA API v2.
-    Каскад: EIA API → celsiusenergy → fallback.
-    """
-
     if EIA_API_KEY:
         try:
             url = (
@@ -816,7 +843,6 @@ def send_telegram(text, is_change_alert=False):
         print("[Вне CME-часов] Сигнал залогирован, но не отправлен в Telegram")
         return False
 
-    # Обрезка длинных сообщений (лимит Telegram — 4096 символов)
     if len(text) > 4000:
         text = text[:4000] + "\n…(обрезано)"
 
@@ -986,8 +1012,12 @@ def main():
 
     # ── Блок новостей с количеством и заголовками ──
     msg += "━━━━ НОВОСТИ ━━━━\n"
-    msg += f"📰 Всего: {news_stats['total']} | Скоринг: {news_stats['scored']} | Без скоринга: {news_stats['unscored']}\n"
-    msg += news_msg
+    if news_stats['total'] == 0:
+        msg += "📰 Новостей за последние 24 часа не найдено.\n"
+        msg += "(Проверьте доступность RSS-фидов или попробуйте позже)\n"
+    else:
+        msg += f"📰 Всего: {news_stats['total']} | Скоринг: {news_stats['scored']} | Без скоринга: {news_stats['unscored']}\n"
+        msg += news_msg
 
     msg += "━━━━ ML-ПРОГНОЗ ━━━━\n" + ml_msg + "\n"
 
