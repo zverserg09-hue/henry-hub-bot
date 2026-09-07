@@ -9,6 +9,7 @@ Henry Hub Natural Gas — автоматическая система сигна
 2. Date mismatch между Yahoo (21:00) и EIA (00:00) — .normalize() перед join
 3. Powerburn: парсинг celsiusenergy.net не работал (JS-рендеринг) — заменён на EIA API
 4. ML-прогноз интегрирован в скоринг (ml_predict.py)
+5. Консервативная логика determine_signal: фильтры по ML, новостям и уровням
 """
 
 import os
@@ -556,11 +557,10 @@ def fetch_powerburn():
     Получает данные о powerburn и генерации через EIA API v2.
     Эндпоинт: electricity/rto/fuel-type-data (часовая генерация по типам топлива)
 
-    Если EIA недоступен — fallback на правдоподобные значения
-    (~42% газ, ~15% уголь).
+    Каскад: EIA API → старый парсинг celsiusenergy → fallback.
     """
 
-    # Попытка 1: EIA API — генерация по типам топлива
+    # Попытка 1: EIA API
     if EIA_API_KEY:
         try:
             url = (
@@ -599,7 +599,7 @@ def fetch_powerburn():
                     ng_pct = (ng_gen / total_gen * 100) if total_gen > 0 else 0
                     coal_pct = (coal_gen / total_gen * 100) if total_gen > 0 else 0
 
-                    # Powerburn (BCF/d) ≈ ng_gen_MWh × 7.5 MMBtu/MWh / 1,000,000 × 24
+                    # Powerburn BCF/d ≈ ng_gen_MWh × 7.5 MMBtu/MWh / 1,000,000 × 24
                     daily_bcf = (ng_gen * 7.5 / 1_000_000) * 24 if ng_gen > 0 else 0
 
                     logging.info(
@@ -621,7 +621,7 @@ def fetch_powerburn():
         except Exception as e:
             logging.error(f"[Powerburn] EIA API error: {e}")
 
-    # Попытка 2: старый парсинг celsiusenergy (может сработать)
+    # Попытка 2: парсинг celsiusenergy (fallback-2)
     try:
         url = "https://www.celsiusenergy.net/p/powerburn.html"
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=15)
@@ -645,7 +645,7 @@ def fetch_powerburn():
     except Exception as e:
         logging.error(f"[Powerburn] CelsiusEnergy error: {e}")
 
-    # Попытка 3: Fallback
+    # Попытка 3: Fallback на правдоподобные значения
     logging.warning("[Powerburn] Все источники недоступны — fallback значения")
     return {
         "realtime_bcf": 28.0,
@@ -687,7 +687,7 @@ def score_powerburn(pb):
     return max(-3, min(3, score)), msg
 
 # ============================================================
-# МОДУЛЬ 8: СКОРИНГ
+# МОДУЛЬ 8: СКОРИНГ И СИГНАЛ (консервативная логика)
 # ============================================================
 
 def calculate_score(ind, level_score, storage_score, season_score,
@@ -718,14 +718,56 @@ def calculate_score(ind, level_score, storage_score, season_score,
 
     return max(-15, min(15, score))
 
-def determine_signal(score):
-    if score >= 4: return "🟢 СИЛЬНЫЙ ЛОНГ"
-    elif score >= 2: return "🟡 ЛОНГ"
-    elif score >= 1: return "⚪ СЛАБЫЙ ЛОНГ"
-    elif score <= -4: return "🔴 СИЛЬНЫЙ ШОРТ"
-    elif score <= -2: return "🟠 ШОРТ"
-    elif score <= -1: return "🔵 СЛАБЫЙ ШОРТ"
-    else: return "⬜ ВНЕ ПОЗИЦИИ"
+
+def determine_signal(score, ml_available, news_score, price,
+                     support=None, resistance=None):
+    """
+    Консервативная логика сигнала: приоритет — не потерять, а не заработать.
+    Симметричные фильтры для лонга и шорта.
+
+    Параметры:
+        score        — итоговый скоринг (-15..+15)
+        ml_available — загружен ли ML-модуль
+        news_score   — скоринг новостей (-5..+5)
+        price        — текущая цена
+        support      — ближайший уровень поддержки (или None)
+        resistance   — ближайший уровень сопротивления (или None)
+    """
+    # ── Фильтр 1: без ML — не торгуем ──
+    if not ml_available:
+        return "⬜ ВНЕ ПОЗИЦИИ (нет ML — не торгуем)"
+
+    # ── Фильтр 2: нейтральные новости — гасим сильные сигналы ──
+    if news_score == 0:
+        if score >= 4:
+            score = 2   # «сильный лонг» → «лонг»
+        elif score <= -4:
+            score = -2  # «сильный шорт» → «шорт»
+
+    # ── Фильтр 3: близость к уровню — не входим против уровня ──
+    # Лонг: не даём, если цена в пределах 0.5% над поддержкой
+    if support and ((price - support) / support) < 0.005:
+        return "⬜ ВНЕ ПОЗИЦИИ (цена вплотную к поддержке — риск ложного пробоя)"
+    # Шорт: не даём, если цена в пределах 0.5% под сопротивлением
+    if resistance and ((resistance - price) / price) < 0.005:
+        return "⬜ ВНЕ ПОЗИЦИИ (цена вплотную к сопротивлению — риск выноса)"
+
+    # ── Основная логика скоринга ──
+    if score >= 4:
+        return "🟢 СИЛЬНЫЙ ЛОНГ"
+    elif score >= 2:
+        return "🟡 ЛОНГ"
+    elif score >= 1:
+        return "⚪ СЛАБЫЙ ЛОНГ"
+    elif score <= -4:
+        return "🔴 СИЛЬНЫЙ ШОРТ"
+    elif score <= -2:
+        return "🟠 ШОРТ"
+    elif score <= -1:
+        return "🔵 СЛАБЫЙ ШОРТ"
+    else:
+        return "⬜ ВНЕ ПОЗИЦИИ"
+
 
 # ============================================================
 # МОДУЛЬ 9: TELEGRAM
@@ -837,7 +879,17 @@ def main():
         ind, level_score, storage_score, season_score,
         news_score, pb_score, ml_score
     )
-    signal = determine_signal(total_score)
+
+    # ── Консервативная логика сигнала ──
+    signal = determine_signal(
+        score=total_score,
+        ml_available=ML_AVAILABLE,
+        news_score=news_score,
+        price=ind["price"],
+        support=nearest_sup,
+        resistance=nearest_res,
+    )
+
     price, atr = ind["price"], ind["atr"]
 
     is_long = "ЛОНГ" in signal
@@ -868,7 +920,7 @@ def main():
 
     save_last_signal(signal, total_score, price)
 
-    # Формирование сообщения
+    # ── Формирование сообщения ──
     msg = f"{signal}\nScore: {total_score}/15\nЦена: ${price:.3f}\n"
     eia_spot = df["EIA_Spot"].iloc[-1] if "EIA_Spot" in df.columns else np.nan
     if not np.isnan(eia_spot):
