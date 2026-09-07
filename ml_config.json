@@ -30,8 +30,8 @@
     "1": "neutral",
     "2": "up"
   },
-  "backtest_accuracy": 0.5619999999999999,
-  "backtest_f1": 0.5632085952234235,
-  "train_date": "2026-09-06T19:05:23.252634",
+  "backtest_accuracy": 0.576,
+  "backtest_f1": 0.5745645698701315,
+  "train_date": "2026-09-07T01:33:38.897222",
   "train_samples": 1054
 }
