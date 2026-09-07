@@ -3,6 +3,11 @@ Henry Hub Natural Gas — автоматическая система сигна
 Анализ: техника + уровни + Volume Profile + запасы EIA + новости + Powerburn + ML
 Источники цен: Yahoo Finance (NG=F фьючерс) + EIA API v2 (Henry Hub спот, RNGWHHD)
 Режимы: --once (один прогон) | --loop (цикл) | --test (без Telegram)
+
+ИСПРАВЛЕНО:
+1. EIA Storage: убран несуществующий facet region=US, добавлен start=
+2. News feeds: заменены мёртвые фиды, добавлен regex-fallback для битого XML
+3. В Telegram-сообщение добавлен блок с количеством новостей и заголовками
 """
 
 import os
@@ -378,8 +383,6 @@ def get_eia_storage():
         logging.info("EIA API key не задан — fallback-значения запасов")
         return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
 
-    # ИСПРАВЛЕНО: убран несуществующий facet region=US
-    # ИСПРАВЛЕНО: добавлен параметр start= для гарантии возврата нескольких недель
     attempts = [
         {"facets": "facets[duoarea][]=NUS&facets[process][]=SAV", "label": "duoarea=NUS+process=SAV"},
         {"facets": "facets[process][]=SAV", "label": "process=SAV"},
@@ -483,8 +486,10 @@ NEWS_KEYWORDS = {
 }
 
 def parse_news():
-    # ИСПРАВЛЕНО: заменены неработающие/мёртвые фиды
-    # ИСПРАВЛЕНО: добавлен tolerant-парсинг с regex-fallback для битого XML
+    """
+    Парсит RSS-фиды, возвращает список заголовков.
+    Логирует количество и источник каждого фида.
+    """
     feeds = [
         "https://www.naturalgasintel.com/rss",
         "https://feeds.feedburner.com/EIA-TodayInEnergy",
@@ -495,42 +500,60 @@ def parse_news():
     cutoff = datetime.now() - timedelta(hours=24)
 
     for feed in feeds:
+        feed_count = 0
         try:
             r = requests.get(feed, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             content = r.content
-            # Удаляем BOM и невалидные XML-символы
             content = content.replace(b"\x00", b"").replace(b"\x0b", b"")
             try:
                 root = ET.fromstring(content)
+                for item in root.findall(".//item"):
+                    title = item.findtext("title", "")
+                    pub_str = item.findtext("pubDate", "")
+                    pub_date = None
+                    if pub_str:
+                        try:
+                            pub_date = parsedate_to_datetime(pub_str).replace(tzinfo=None)
+                        except Exception:
+                            pub_date = None
+                    if title and (pub_date is None or pub_date >= cutoff):
+                        titles.append(title)
+                        feed_count += 1
             except ET.ParseError:
-                # Fallback: regex-извлечение <title>...</title>
                 titles_text = re.findall(
                     r"<title>(.*?)</title>",
                     content.decode("utf-8", errors="ignore"),
                     re.DOTALL,
                 )
-                titles.extend(titles_text[:5])
+                for t in titles_text[:5]:
+                    titles.append(t)
+                    feed_count += 1
                 continue
 
-            for item in root.findall(".//item"):
-                title = item.findtext("title", "")
-                pub_str = item.findtext("pubDate", "")
-                pub_date = None
-                if pub_str:
-                    try:
-                        pub_date = parsedate_to_datetime(pub_str).replace(tzinfo=None)
-                    except Exception:
-                        pub_date = None
-                if title and (pub_date is None or pub_date >= cutoff):
-                    titles.append(title)
         except Exception as e:
             logging.warning(f"News feed error: {feed} — {e}")
+
+        logging.info(f"[News] {feed}: {feed_count} заголовков")
+
+    logging.info(f"[News] Всего собрано заголовков: {len(titles)}")
+    if len(titles) == 0:
+        logging.error("[News] КРИТИЧНО: Новости не получены ни из одного источника!")
+    else:
+        for t in titles[:3]:
+            logging.info(f"[News Sample] {t[:80]}")
 
     return titles
 
 def score_news(titles):
+    """
+    Скоринг новостей по ключевым словам.
+    Возвращает: total_score, msg, stats
+    stats — словарь с количеством заголовков и списком необработанных.
+    """
     category_scores = {}
     category_msgs = {}
+    scored_titles = set()
+
     for title in titles:
         t = title.lower()
         for category, keywords in NEWS_KEYWORDS.items():
@@ -545,9 +568,15 @@ def score_news(titles):
                     if len(category_msgs[category]) < 2:
                         emoji = "📈" if contribution > 0 else "📉"
                         category_msgs[category].append(f'{emoji} "{title[:80]}" → {contribution:+d}')
+                    scored_titles.add(title)
+
     for cat in category_scores:
         category_scores[cat] = max(-5, min(5, category_scores[cat]))
     total = max(-5, min(5, sum(category_scores.values())))
+
+    # Нескорингованные заголовки (не попали ни в одну категорию)
+    unscored = [t for t in titles if t not in scored_titles]
+
     cat_names = {
         "weather": "🌤️ Погода",
         "lng": "🚢 LNG/Экспорт",
@@ -555,12 +584,27 @@ def score_news(titles):
         "demand": "⚡ Спрос",
         "geopolitics": "🌍 Геополитика",
     }
-    msg = f"Скоринг: {total:+d} ({'📈 бычий' if total > 0 else '📉 медвежий' if total < 0 else '➡️ нейтральный'})\n"
+    msg = f"Всего заголовков: {len(titles)}\n"
+    msg += f"Скоринг: {total:+d} ({'📈 бычий' if total > 0 else '📉 медвежий' if total < 0 else '➡️ нейтральный'})\n"
     for cat, score in sorted(category_scores.items(), key=lambda x: abs(x[1]), reverse=True):
         msg += f"{cat_names.get(cat, cat)}: {score:+d} {'📈' if score > 0 else '📉'}\n"
         for m in category_msgs[cat]:
             msg += f"  {m}\n"
-    return total, msg
+
+    # Топ-3 несгорированных заголовка
+    if unscored:
+        msg += f"📄 Без скоринга ({len(unscored)}):\n"
+        for t in unscored[:3]:
+            msg += f"  • {t[:80]}\n"
+
+    stats = {
+        "total": len(titles),
+        "scored": len(scored_titles),
+        "unscored": len(unscored),
+        "unscored_sample": unscored[:5],
+    }
+
+    return total, msg, stats
 
 # ============================================================
 # МОДУЛЬ 7: POWERBURN (через EIA API + fallback)
@@ -569,12 +613,9 @@ def score_news(titles):
 def fetch_powerburn():
     """
     Получает данные о powerburn и генерации через EIA API v2.
-    Эндпоинт: electricity/rto/fuel-type-data (часовая генерация по типам топлива)
-
-    Каскад: EIA API → старый парсинг celsiusenergy → fallback.
+    Каскад: EIA API → celsiusenergy → fallback.
     """
 
-    # Попытка 1: EIA API
     if EIA_API_KEY:
         try:
             url = (
@@ -613,7 +654,6 @@ def fetch_powerburn():
                     ng_pct = (ng_gen / total_gen * 100) if total_gen > 0 else 0
                     coal_pct = (coal_gen / total_gen * 100) if total_gen > 0 else 0
 
-                    # Powerburn BCF/d ≈ ng_gen_MWh × 7.5 MMBtu/MWh / 1,000,000 × 24
                     daily_bcf = (ng_gen * 7.5 / 1_000_000) * 24 if ng_gen > 0 else 0
 
                     logging.info(
@@ -635,7 +675,6 @@ def fetch_powerburn():
         except Exception as e:
             logging.error(f"[Powerburn] EIA API error: {e}")
 
-    # Попытка 2: парсинг celsiusenergy (fallback-2)
     try:
         url = "https://www.celsiusenergy.net/p/powerburn.html"
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=15)
@@ -659,7 +698,6 @@ def fetch_powerburn():
     except Exception as e:
         logging.error(f"[Powerburn] CelsiusEnergy error: {e}")
 
-    # Попытка 3: Fallback на правдоподобные значения
     logging.warning("[Powerburn] Все источники недоступны — fallback значения")
     return {
         "realtime_bcf": 28.0,
@@ -701,7 +739,7 @@ def score_powerburn(pb):
     return max(-3, min(3, score)), msg
 
 # ============================================================
-# МОДУЛЬ 8: СКОРИНГ И СИГНАЛ (консервативная логика)
+# МОДУЛЬ 8: СКОРИНГ И СИГНАЛ
 # ============================================================
 
 def calculate_score(ind, level_score, storage_score, season_score,
@@ -709,13 +747,14 @@ def calculate_score(ind, level_score, storage_score, season_score,
     score = 0
     price, rsi, ma200 = ind["price"], ind["rsi"], ind["ma200"]
 
-    # Технические индикаторы
     if rsi > 70: score -= 2
     elif rsi < 30: score += 2
     elif rsi > 60: score -= 1
     elif rsi < 40: score += 1
 
-    if price < ma200: score -= 1
+    if np.isnan(ma200):
+        pass
+    elif price < ma200: score -= 1
     elif price > ma200: score += 1
 
     if abs(price - ind["bb_upper"]) < 0.02 * price: score -= 1
@@ -724,10 +763,7 @@ def calculate_score(ind, level_score, storage_score, season_score,
     if ind["macd_hist"] < 0: score -= 1
     elif ind["macd_hist"] > 0: score += 1
 
-    # Фундаментальные факторы
     score += season_score + storage_score + level_score + news_score + pb_score
-
-    # ML-прогноз
     score += ml_score
 
     return max(-15, min(15, score))
@@ -735,38 +771,20 @@ def calculate_score(ind, level_score, storage_score, season_score,
 
 def determine_signal(score, ml_available, news_score, price,
                      support=None, resistance=None):
-    """
-    Консервативная логика сигнала: приоритет — не потерять, а не заработать.
-    Симметричные фильтры для лонга и шорта.
-
-    Параметры:
-        score        — итоговый скоринг (-15..+15)
-        ml_available — загружен ли ML-модуль
-        news_score   — скоринг новостей (-5..+5)
-        price        — текущая цена
-        support      — ближайший уровень поддержки (или None)
-        resistance   — ближайший уровень сопротивления (или None)
-    """
-    # ── Фильтр 1: без ML — не торгуем ──
     if not ml_available:
         return "⬜ ВНЕ ПОЗИЦИИ (нет ML — не торгуем)"
 
-    # ── Фильтр 2: нейтральные новости — гасим сильные сигналы ──
     if news_score == 0:
         if score >= 4:
-            score = 2   # «сильный лонг» → «лонг»
+            score = 2
         elif score <= -4:
-            score = -2  # «сильный шорт» → «шорт»
+            score = -2
 
-    # ── Фильтр 3: близость к уровню — не входим против уровня ──
-    # Лонг: не даём, если цена в пределах 0.5% над поддержкой
     if support and ((price - support) / support) < 0.005:
         return "⬜ ВНЕ ПОЗИЦИИ (цена вплотную к поддержке — риск ложного пробоя)"
-    # Шорт: не даём, если цена в пределах 0.5% под сопротивлением
     if resistance and ((resistance - price) / price) < 0.005:
         return "⬜ ВНЕ ПОЗИЦИИ (цена вплотную к сопротивлению — риск выноса)"
 
-    # ── Основная логика скоринга ──
     if score >= 4:
         return "🟢 СИЛЬНЫЙ ЛОНГ"
     elif score >= 2:
@@ -797,11 +815,16 @@ def send_telegram(text, is_change_alert=False):
         logging.info(f"Вне CME-часов — Telegram не отправляется: {text[:100]}")
         print("[Вне CME-часов] Сигнал залогирован, но не отправлен в Telegram")
         return False
+
+    # Обрезка длинных сообщений (лимит Telegram — 4096 символов)
+    if len(text) > 4000:
+        text = text[:4000] + "\n…(обрезано)"
+
     full_text = ("🚨 *СМЕНА СИГНАЛА* 🚨\n\n" + text) if is_change_alert else text
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": full_text, "parse_mode": "Markdown"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": full_text},
             timeout=10,
         )
         if r.status_code == 200: return True
@@ -875,7 +898,7 @@ def main():
 
     season_score = seasonality_score(now.month)
     news_titles = parse_news()
-    news_score, news_msg = score_news(news_titles)
+    news_score, news_msg, news_stats = score_news(news_titles)
 
     pb_data = fetch_powerburn()
     pb_score, pb_msg = score_powerburn(pb_data)
@@ -894,7 +917,6 @@ def main():
         news_score, pb_score, ml_score
     )
 
-    # ── Консервативная логика сигнала ──
     signal = determine_signal(
         score=total_score,
         ml_available=ML_AVAILABLE,
@@ -935,7 +957,9 @@ def main():
     save_last_signal(signal, total_score, price)
 
     # ── Формирование сообщения ──
-    msg = f"{signal}\nScore: {total_score}/15\nЦена: ${price:.3f}\n"
+    msg = f"{signal}\n"
+    msg += f"Score: {total_score}/15\n"
+    msg += f"Цена: ${price:.3f}\n"
     eia_spot = df["EIA_Spot"].iloc[-1] if "EIA_Spot" in df.columns else np.nan
     if not np.isnan(eia_spot):
         msg += f"EIA спот: ${eia_spot:.3f}\n"
@@ -959,7 +983,12 @@ def main():
     msg += "━━━━ ЗАПАСЫ EIA ━━━━\n" + storage_msg
     msg += "━━━━ УРОВНИ ━━━━\n" + level_msg
     msg += "━━━━ POWERBURN ━━━━\n" + pb_msg
-    msg += "━━━━ НОВОСТИ ━━━━\n" + news_msg
+
+    # ── Блок новостей с количеством и заголовками ──
+    msg += "━━━━ НОВОСТИ ━━━━\n"
+    msg += f"📰 Всего: {news_stats['total']} | Скоринг: {news_stats['scored']} | Без скоринга: {news_stats['unscored']}\n"
+    msg += news_msg
+
     msg += "━━━━ ML-ПРОГНОЗ ━━━━\n" + ml_msg + "\n"
 
     if should_send:
