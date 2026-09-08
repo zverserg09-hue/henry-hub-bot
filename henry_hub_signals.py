@@ -4,15 +4,30 @@ Henry Hub Natural Gas — автоматическая система сигна
 Источники цен: Yahoo Finance (NG=F фьючерс) + EIA API v2 (Henry Hub спот, RNGWHHD)
 Режимы: --once (один прогон) | --loop (цикл) | --test (без Telegram)
 
-Версия: 2026-09-07 (RSS fix)
-Изменения:
-- Заменены все мёртвые RSS-фиды на проверенные живые
-- OilPrice: /rss/home.rss (404) → /rss/main (рабочий)
-- Reuters RSS убран (закрыт в 2020)
-- Feedburner EIA убран (404)
-- NaturalGasIntel убран (405 — блокировка ботов)
-- Добавлены: Invezz Commodities, Natural Gas World, World Oil, Yahoo Finance Energy
-- Сохранён приоритетный/резервный механизм
+Версия: 2026-09-08 (Strategy v3)
+Все изменения:
+
+  СКОРИНГ И СИГНАЛЫ:
+  1. Расширена нейтральная зона: score -1..+1 → ВНЕ ПОЗИЦИИ (было только 0)
+  2. Новая карта порогов: СИЛЬНЫЙ ±6, средний ±4, слабый ±2
+  3. RSI+MA200: в сильном тренде (ADX≥25) RSI>70 или <30 не штрафуется
+  4. ADX-фильтр: BB работают как контртренд в боковике, нейтральны в тренде
+  5. Сезонность снижена с ±3 до ±1 — статистическая склонность, не сигнал
+  6. ML: не блокирующий — без ML торгуются только сильные сигналы (|score|≥4)
+  7. News score=0: различие «нет заголовков» (фиоды упали) vs «нейтральные» (даунгрейд)
+
+  ФУНДАМЕНТ:
+  8. Storage: сезонная норма по месяцам вместо фиксированных 3000 Bcf
+  9. Volume Profile: детектор нулевого объёма — отключение VP-скоринга при vol=0
+
+  НОВОСТИ v2 (накопительная модель + качество):
+  10. Word-boundary regex: «heat» не совпадает с «wheat», «storm» не с «stormy»
+  11. Масштабирование по подтверждениям: 1 заголовок ×0.4, 2 ×0.7, 3+ ×1.0
+  12. Мульти-категорийный бонус: 2+ однонаправленные категории → ±1
+  (вес ±5 сохранён — для газа новости критичны)
+
+  РИСК-МЕНЕДЖМЕНТ:
+  13. TP1=3×ATR, TP2=5×ATR (R/R=2:1, было 1.33:1)
 """
 
 import os
@@ -20,6 +35,7 @@ import re
 import sys
 import time
 import json
+import hashlib
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -52,6 +68,7 @@ STORAGE_FORECAST    = float(os.environ.get("STORAGE_FORECAST", "19"))
 SYMBOL = "NG=F"
 LOG_FILE = "henry_hub_signals.log"
 LAST_SIGNAL_FILE = "last_signal.json"
+NEWS_HISTORY_FILE = "news_history.json"
 
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -60,6 +77,23 @@ CME_END_HOUR_MSK   = 23
 
 REGULAR_INTERVAL_HOURS = 4
 SCORE_CHANGE_THRESHOLD  = 3
+
+# ── Настройки новостного модуля v2 ──
+NEWS_DECAY_HOURS         = 24    # период полураспада (часы)
+NEWS_MAX_AGE_HOURS       = 48    # удалять новости старше этого срока
+NEWS_BURST_WINDOW_HOURS  = 2     # окно для детекции всплеска (часы)
+NEWS_BURST_THRESHOLD     = 3     # сколько однонаправленных новостей = всплеск
+NEWS_MOMENTUM_WEIGHT     = 0.5   # вес моментума в composite-скоре
+
+# ── Сезонная норма запасов (5-летнее среднее по месяцам, Bcf) ──
+STORAGE_SEASONAL_NORM = {
+    1: 2700, 2: 2300, 3: 1900, 4: 1700, 5: 1900, 6: 2200,
+    7: 2500, 8: 2800, 9: 3100, 10: 3400, 11: 3600, 12: 3300,
+}
+
+# ── ADX пороги ──
+ADX_TREND_THRESHOLD  = 25   # ADX ≥ 25 → тренд
+ADX_RANGE_THRESHOLD  = 20   # ADX < 20 → боковик
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -211,8 +245,45 @@ def fetch_prices():
     return primary, source_label
 
 # ============================================================
-# МОДУЛЬ 2: ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ
+# МОДУЛЬ 2: ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ (с ADX)
 # ============================================================
+
+def calc_adx(df, period=14):
+    """Расчёт ADX (Average Directional Index) по Wilder."""
+    high, low, close = df["High"], df["Low"], df["Close"]
+
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    up_move = high.diff()
+    down_move = -low.diff()  # prevLow - Low
+
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=df.index, dtype=float
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=df.index, dtype=float
+    )
+
+    atr_w = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_dm_s = plus_dm.ewm(alpha=1/period, adjust=False).mean()
+    minus_dm_s = minus_dm.ewm(alpha=1/period, adjust=False).mean()
+
+    plus_di = 100 * plus_dm_s / atr_w
+    minus_di = 100 * minus_dm_s / atr_w
+
+    di_sum = plus_di + minus_di
+    dx = 100 * (plus_di - minus_di).abs() / di_sum
+    dx = dx.replace([np.inf, -np.inf], np.nan)
+
+    adx = dx.ewm(alpha=1/period, adjust=False).mean()
+    result = adx.iloc[-1]
+    return result if not np.isnan(result) else 25.0
+
 
 def calc_indicators(df):
     close = df["Close"]
@@ -247,16 +318,19 @@ def calc_indicators(df):
     )
     atr = tr.rolling(14).mean().iloc[-1]
 
+    adx = calc_adx(df)
+
     return {
         "price": close.iloc[-1], "rsi": rsi, "ma50": ma50, "ma200": ma200,
         "bb_upper": bb_upper, "bb_lower": bb_lower,
-        "macd_hist": macd_hist, "atr": atr,
+        "macd_hist": macd_hist, "atr": atr, "adx": adx,
     }
 
 def seasonality_score(month):
+    # Снижено с ±3 до ±1 — статистическая склонность, не торговый сигнал
     scores = {
-        1: 3, 2: 2, 3: 1, 4: -1, 5: -2, 6: -1,
-        7: 0, 8: -1, 9: -2, 10: -1, 11: 2, 12: 3,
+        1: 1, 2: 1, 3: 0, 4: -1, 5: -1, 6: 0,
+        7: 0, 8: 0, 9: -1, 10: 0, 11: 1, 12: 1,
     }
     return scores.get(month, 0)
 
@@ -284,17 +358,22 @@ def calc_pivots(df):
             "R2": p + (h - l), "S2": p - (h - l)}
 
 # ============================================================
-# МОДУЛЬ 4: VOLUME PROFILE
+# МОДУЛЬ 4: VOLUME PROFILE (с детектором нулевого объёма)
 # ============================================================
 
 def volume_profile(df, lookback=60, num_bins=40):
     data = df.tail(lookback)
     if len(data) == 0:
-        return {"poc": 0, "val": 0, "vah": 0, "hvn": []}
+        return {"poc": 0, "val": 0, "vah": 0, "hvn": [], "zero_volume": True}
+
+    # Проверка: есть ли реальный объём
+    avg_vol = data["Volume"].mean() if "Volume" in data.columns else 0
+    zero_volume = (avg_vol is None or np.isnan(avg_vol) or avg_vol < 100)
+
     min_p = data["Low"].min()
     max_p = data["High"].max()
     if min_p == max_p:
-        return {"poc": min_p, "val": min_p, "vah": min_p, "hvn": [min_p]}
+        return {"poc": min_p, "val": min_p, "vah": min_p, "hvn": [min_p], "zero_volume": zero_volume}
 
     bins = np.linspace(min_p, max_p, num_bins + 1)
     vol_by_bin = np.zeros(num_bins)
@@ -303,6 +382,8 @@ def volume_profile(df, lookback=60, num_bins=40):
         vol = row.get("Volume", 1)
         if vol is None or (isinstance(vol, float) and np.isnan(vol)):
             vol = 1
+        if zero_volume:
+            vol = 1  # Равномерное распределение при отсутствии объёма
         for b in range(num_bins):
             if bins[b] <= price < bins[b + 1]:
                 vol_by_bin[b] += vol
@@ -312,7 +393,7 @@ def volume_profile(df, lookback=60, num_bins=40):
     poc = (bins[poc_idx] + bins[poc_idx + 1]) / 2
     total_vol = vol_by_bin.sum()
     if total_vol == 0:
-        return {"poc": poc, "val": min_p, "vah": max_p, "hvn": [poc]}
+        return {"poc": poc, "val": min_p, "vah": max_p, "hvn": [poc], "zero_volume": zero_volume}
 
     target = 0.70 * total_vol
     accumulated = vol_by_bin[poc_idx]
@@ -333,16 +414,22 @@ def volume_profile(df, lookback=60, num_bins=40):
     vah = (bins[hi_idx] + bins[hi_idx + 1]) / 2
     top_indices = np.argsort(vol_by_bin)[-3:][::-1]
     hvn = [(bins[i] + bins[i + 1]) / 2 for i in top_indices if vol_by_bin[i] > 0]
-    return {"poc": poc, "val": val, "vah": vah, "hvn": hvn}
+    return {"poc": poc, "val": val, "vah": vah, "hvn": hvn, "zero_volume": zero_volume}
 
 def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     level_score = 0
-    msg = f"POC: ${vp['poc']:.3f}\n"
+    zero_vol = vp.get("zero_volume", False)
+
+    msg = f"POC: ${vp['poc']:.3f}"
+    if zero_vol:
+        msg += " ⚠️ (нет данных объёма — равномерное распределение)"
+    msg += "\n"
     msg += f"Value Area: ${vp['val']:.3f} — ${vp['vah']:.3f}\n"
 
     nearest_sup = None
     nearest_res = None
 
+    # ── Swing levels: всегда работают ──
     sups_below = [s for s in support_lvls if s < price]
     if sups_below:
         nearest_sup = max(sups_below)
@@ -365,14 +452,16 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
 
     msg += f"📐 Pivot: P=${pivots['P']:.3f} R1=${pivots['R1']:.3f} S1=${pivots['S1']:.3f}\n"
 
-    if price > vp["poc"]:
-        level_score += 1
-    if vp["val"] <= price <= vp["vah"]:
-        pass
-    elif price > vp["vah"]:
-        level_score += 1
-    elif price < vp["val"]:
-        level_score -= 1
+    # ── VP-скоринг: только при реальном объёме ──
+    if not zero_vol:
+        if price > vp["poc"]:
+            level_score += 1
+        if vp["val"] <= price <= vp["vah"]:
+            pass
+        elif price > vp["vah"]:
+            level_score += 1
+        elif price < vp["val"]:
+            level_score -= 1
 
     if vp["hvn"]:
         msg += f"📊 HVN: {', '.join([f'${h:.3f}' for h in vp['hvn']])}\n"
@@ -380,7 +469,7 @@ def format_levels_message(price, vp, support_lvls, resistance_lvls, pivots):
     return msg, level_score, nearest_sup, nearest_res
 
 # ============================================================
-# МОДУЛЬ 5: ЗАПАСЫ EIA
+# МОДУЛЬ 5: ЗАПАСЫ EIA (с сезонной нормой)
 # ============================================================
 
 def get_eia_storage():
@@ -459,10 +548,15 @@ def get_eia_storage():
     logging.warning("❌ [EIA Storage] Все попытки неудачны — fallback")
     return STORAGE_CURRENT_BCF, LAST_STORAGE_BUILD, STORAGE_FORECAST
 
-def score_storage(storage_bcf, build, forecast):
+def score_storage(storage_bcf, build, forecast, month=None):
+    """Скоринг запасов с сезонной нормой вместо фиксированных 3000 Bcf."""
+    if month is None:
+        month = datetime.now().month
+    norm = STORAGE_SEASONAL_NORM.get(month, 3000)
+
     score = 0
-    pct = (storage_bcf - 3000) / 3000 * 100
-    msg = f"Текущие: {storage_bcf:.0f} Bcf ({pct:+.1f}% к 5л ср.)\n"
+    pct = (storage_bcf - norm) / norm * 100
+    msg = f"Текущие: {storage_bcf:.0f} Bcf ({pct:+.1f}% к сезонной норме {norm:.0f})\n"
     if pct > 5:
         score -= 2
         msg += "📈 Запасы выше нормы → давление на цену\n"
@@ -479,7 +573,7 @@ def score_storage(storage_bcf, build, forecast):
     return score, msg
 
 # ============================================================
-# МОДУЛЬ 6: НОВОСТИ
+# МОДУЛЬ 6: НОВОСТИ v2 — накопительная модель + качество
 # ============================================================
 
 NEWS_KEYWORDS = {
@@ -490,7 +584,6 @@ NEWS_KEYWORDS = {
     "geopolitics": [("sanctions",2,"bull"),("ukraine",2,"bull"),("hormuz",2,"bull"),("middle east tension",2,"bull"),("russia gas",2,"bull"),("trade war",-1,"bear")],
 }
 
-# Стоп-слова для фильтрации мусорных заголовков
 JUNK_STOPWORDS = [
     "human verification", "captcha", "verify your identity",
     "error 404", "not found", "page not found", "access denied",
@@ -501,7 +594,6 @@ JUNK_STOPWORDS = [
 ]
 
 def is_valid_title(title: str) -> bool:
-    """Возвращает False, если заголовок — мусор (ошибка, капча, заглушка)."""
     if not title or len(title.strip()) < 5:
         return False
     t_lower = title.lower()
@@ -511,51 +603,32 @@ def is_valid_title(title: str) -> bool:
     return True
 
 def parse_news():
-    """
-    Парсит RSS-фиды с приоритетом: рабочие → резервные.
-    Все URL проверены 2026-09-07.
-
-    ПРИОРИТЕТНЫЕ — тематические (газ/энергетика):
-      1. OilPrice /rss/main      — 15 заголовков, энергетика
-      2. Invezz commodities       — 50 заголовков, сырьё
-      3. Natural Gas World        — 20 заголовков, только газ
-      4. World Oil                 — 10 заголовков, нефтегаз
-
-    РЕЗЕРВНЫЕ — общие (подключаются если приоритетные пусты):
-      1. Yahoo Finance Energy      — 50 заголовков, общие новости энергетики
-    """
     primary_feeds = [
         "https://oilprice.com/rss/main",
         "https://invezz.com/news/commodities/feed/",
         "https://www.naturalgasworld.com/rss",
         "https://worldoil.com/rss?feed=news",
     ]
-
     backup_feeds = [
         "https://finance.yahoo.com/rss/sector/energy",
     ]
 
     titles = []
-    cutoff = datetime.now() - timedelta(hours=24)
+    cutoff = datetime.now() - timedelta(hours=NEWS_MAX_AGE_HOURS)
 
     def try_feed(feed_url, feed_type="primary"):
-        """Пытается распарсить один фид, логирует результат."""
         feed_count = 0
         try:
             r = requests.get(feed_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-
             content_type = r.headers.get("Content-Type", "")
             if "xml" not in content_type.lower() and "rss" not in content_type.lower() and "text" not in content_type.lower():
                 logging.warning(f"[News] {feed_type}: {feed_url} → Content-Type={content_type} — пропускаем")
                 return 0
-
             if r.status_code != 200:
                 logging.warning(f"[News] {feed_type}: {feed_url} HTTP {r.status_code} — пропускаем")
                 return 0
-
             content = r.content
             content = content.replace(b"\x00", b"").replace(b"\x0b", b"")
-
             try:
                 root = ET.fromstring(content)
                 for item in root.iter():
@@ -563,23 +636,21 @@ def parse_news():
                     if tag_name == "item":
                         title = item.findtext("title", "")
                         pub_str = item.findtext("pubDate", "")
-
                         if not is_valid_title(title):
                             continue
-
                         pub_date = None
                         if pub_str:
                             try:
-                                pub_date = parsedate_to_datetime(pub_str).replace(tzinfo=None)
+                                pub_date = parsedate_to_datetime(pub_str)
+                                if pub_date.tzinfo is not None:
+                                    pub_date = pub_date.replace(tzinfo=None)
                             except Exception:
                                 pub_date = None
-
                         if title and (pub_date is None or pub_date >= cutoff):
                             titles.append(title)
                             feed_count += 1
             except ET.ParseError as e:
                 logging.error(f"[News] XML Parse Error for {feed_url}: {e}")
-                # Fallback: regex для битого XML
                 titles_text = re.findall(
                     r"<title>(.*?)</title>",
                     content.decode("utf-8", errors="ignore"),
@@ -590,18 +661,13 @@ def parse_news():
                     if is_valid_title(clean_t):
                         titles.append(clean_t)
                         feed_count += 1
-
         except Exception as e:
             logging.warning(f"News feed error: {feed_url} — {e}")
-
         logging.info(f"[News] {feed_type}: {feed_url.split('/')[2]} → {feed_count} валидных заголовков")
         return feed_count
 
-    # Сначала пробуем приоритетные
     for feed in primary_feeds:
         try_feed(feed, "primary")
-
-    # Если приоритетные пусты — пробуем резервные
     if len(titles) == 0:
         logging.info("[News] Приоритетные фиды пусты — подключаем резервные...")
         for feed in backup_feeds:
@@ -615,40 +681,220 @@ def parse_news():
     else:
         for t in titles[:3]:
             logging.info(f"[News Sample] {t[:80]}")
-
     return titles
 
-def score_news(titles):
-    """
-    Скоринг новостей по ключевым словам.
-    Возвращает: total_score, msg, stats
-    """
-    category_scores = {}
-    category_msgs = {}
-    scored_titles = set()
 
+# ── Хранилище истории новостей ──
+
+def _news_hash(title: str) -> str:
+    normalized = re.sub(r"\s+", " ", title.strip().lower())
+    return hashlib.md5(normalized.encode("utf-8")).hexdigest()
+
+
+def _score_single_title(title: str):
+    """
+    Скорит один заголовок по ключевым словам с word-boundary regex.
+    «heat» не совпадает с «wheat», «storm» не с «stormy».
+    """
+    t = title.lower()
+    best = (0, None, None)
+    for category, keywords in NEWS_KEYWORDS.items():
+        for word, pts, direction in keywords:
+            # Word-boundary regex вместо простого in
+            if re.search(r'\b' + re.escape(word) + r'\b', t):
+                sign = 1 if direction == "bull" else -1
+                contribution = pts * sign
+                # Берём максимальный по модулю результат
+                if abs(contribution) > abs(best[0]):
+                    best = (contribution, category, direction)
+    return best
+
+
+def _decay_weight(age_hours: float, half_life: float = NEWS_DECAY_HOURS) -> float:
+    if age_hours < 0:
+        age_hours = 0
+    return 0.5 ** (age_hours / half_life)
+
+
+def load_news_history() -> dict:
+    try:
+        with open(NEWS_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_news_history(history: dict):
+    try:
+        with open(NEWS_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"[News History] Ошибка сохранения: {e}")
+
+
+def score_news_v2(titles, history):
+    """
+    Накопительный скоринг с временным затуханием, моментумом, burst-детекцией,
+    word-boundary regex, масштабированием по подтверждениям и мульти-категорийным бонусом.
+    """
+    now = datetime.now()
+
+    # ── Шаг 1: Добавить новые заголовки ──
+    new_count = 0
     for title in titles:
-        t = title.lower()
-        for category, keywords in NEWS_KEYWORDS.items():
-            for word, pts, direction in keywords:
-                if word in t:
-                    if category not in category_scores:
-                        category_scores[category] = 0
-                        category_msgs[category] = []
-                    sign = 1 if direction == "bull" else -1
-                    contribution = pts * sign
-                    category_scores[category] += contribution
-                    if len(category_msgs[category]) < 2:
-                        emoji = "📈" if contribution > 0 else "📉"
-                        category_msgs[category].append(f'{emoji} "{title[:80]}" → {contribution:+d}')
-                    scored_titles.add(title)
+        h = _news_hash(title)
+        if h not in history:
+            raw_score, category, direction = _score_single_title(title)
+            history[h] = {
+                "title": title,
+                "score": raw_score,
+                "category": category,
+                "direction": direction,
+                "timestamp": now.isoformat(),
+            }
+            new_count += 1
+        else:
+            entry = history[h]
+            if entry.get("category") is None:
+                raw_score, category, direction = _score_single_title(title)
+                entry["score"] = raw_score
+                entry["category"] = category
+                entry["direction"] = direction
 
+    logging.info(f"[News v2] Новых заголовков: {new_count}")
+
+    # ── Шаг 2: Удалить устаревшие ──
+    cutoff = now - timedelta(hours=NEWS_MAX_AGE_HOURS)
+    expired = [h for h, e in history.items()
+               if h != "__meta__" and (
+                   not e.get("timestamp") or
+                   _safe_parse_dt(e["timestamp"]) < cutoff
+               )]
+    for h in expired:
+        del history[h]
+    if expired:
+        logging.info(f"[News v2] Удалено устаревших: {len(expired)}")
+
+    # ── Шаг 3: Взвешенный скор с затуханием ──
+    category_scores = {}
+    category_titles = {}
+    category_item_counts = {}
+    scored_count = 0
+
+    for h, entry in history.items():
+        if h == "__meta__":
+            continue
+        if entry.get("score") is None or entry.get("score") == 0:
+            continue
+        entry_dt = _safe_parse_dt(entry.get("timestamp", ""))
+        if entry_dt is None:
+            continue
+
+        age_hours = max(0, (now - entry_dt).total_seconds() / 3600)
+        weight = _decay_weight(age_hours, NEWS_DECAY_HOURS)
+        weighted = entry["score"] * weight
+
+        cat = entry.get("category", "other")
+        if cat not in category_scores:
+            category_scores[cat] = 0.0
+            category_titles[cat] = []
+            category_item_counts[cat] = 0
+
+        category_scores[cat] += weighted
+        category_item_counts[cat] += 1
+        scored_count += 1
+
+        if len(category_titles[cat]) < 2:
+            emoji = "📈" if entry["score"] > 0 else "📉"
+            category_titles[cat].append(
+                f'  {emoji} "{entry["title"][:80]}" → {entry["score"]:+d} (w={weight:.2f})'
+            )
+
+    # ── Шаг 3b: Масштабирование по подтверждениям ──
+    # 1 заголовок → ×0.4, 2 → ×0.7, 3+ → ×1.0
+    for cat in category_scores:
+        count = category_item_counts.get(cat, 0)
+        if count == 1:
+            scale = 0.4
+        elif count == 2:
+            scale = 0.7
+        else:
+            scale = 1.0
+        category_scores[cat] *= scale
+        logging.info(f"[News v2] Категория '{cat}': {count} заголовков, масштаб ×{scale}, score={category_scores[cat]:+.2f}")
+
+    # Клампим каждую категорию
     for cat in category_scores:
         category_scores[cat] = max(-5, min(5, category_scores[cat]))
-    total = max(-5, min(5, sum(category_scores.values())))
 
-    unscored = [t for t in titles if t not in scored_titles]
+    weighted_total = sum(category_scores.values())
+    weighted_total = max(-5, min(5, weighted_total))
 
+    # ── Шаг 4: Моментум ──
+    prev_weighted = history.get("__meta__", {}).get("prev_weighted_score", 0)
+    momentum = max(-5, min(5, weighted_total - prev_weighted))
+    logging.info(f"[News v2] weighted={weighted_total:+.2f}, prev={prev_weighted:+.2f}, momentum={momentum:+.2f}")
+
+    if "__meta__" not in history:
+        history["__meta__"] = {}
+    history["__meta__"]["prev_weighted_score"] = weighted_total
+    history["__meta__"]["last_run"] = now.isoformat()
+
+    # ── Шаг 5: Burst-детекция ──
+    burst_window_start = now - timedelta(hours=NEWS_BURST_WINDOW_HOURS)
+    bull_burst = 0
+    bear_burst = 0
+
+    for h, entry in history.items():
+        if h == "__meta__":
+            continue
+        if entry.get("score") is None or entry.get("score") == 0:
+            continue
+        entry_dt = _safe_parse_dt(entry.get("timestamp", ""))
+        if entry_dt is None:
+            continue
+        if entry_dt >= burst_window_start:
+            if entry["score"] > 0:
+                bull_burst += 1
+            elif entry["score"] < 0:
+                bear_burst += 1
+
+    burst = 0
+    burst_msg = ""
+    if bull_burst >= NEWS_BURST_THRESHOLD:
+        burst = min(2, bull_burst - NEWS_BURST_THRESHOLD + 1)
+        burst_msg = f"🔥 Бычий всплеск: {bull_burst} позитивных за {NEWS_BURST_WINDOW_HOURS}ч → +{burst}"
+    elif bear_burst >= NEWS_BURST_THRESHOLD:
+        burst = -min(2, bear_burst - NEWS_BURST_THRESHOLD + 1)
+        burst_msg = f"🔥 Медвежий всплеск: {bear_burst} негативных за {NEWS_BURST_WINDOW_HOURS}ч → {burst}"
+
+    # ── Шаг 5b: Мульти-категорийный бонус ──
+    bull_cats = sum(1 for s in category_scores.values() if s > 0.5)
+    bear_cats = sum(1 for s in category_scores.values() if s < -0.5)
+
+    multi_cat_bonus = 0
+    multi_cat_msg = ""
+    if bull_cats >= 2:
+        multi_cat_bonus = 1
+        multi_cat_msg = f"🔗 Мульти-категорийный бонус: {bull_cats} бычьих категорий → +1"
+    elif bear_cats >= 2:
+        multi_cat_bonus = -1
+        multi_cat_msg = f"🔗 Мульти-категорийный бонус: {bear_cats} медвежьих категорий → -1"
+
+    # ── Шаг 6: Composite-скор ──
+    composite = weighted_total + momentum * NEWS_MOMENTUM_WEIGHT + burst + multi_cat_bonus
+    composite = max(-5, min(5, composite))
+    composite_int = int(round(composite))
+
+    logging.info(
+        f"[News v2] composite={composite_int:+d} "
+        f"(weighted={weighted_total:+.2f} + momentum={momentum:+.2f}×{NEWS_MOMENTUM_WEIGHT} "
+        f"+ burst={burst:+d} + multi_cat={multi_cat_bonus:+d})"
+    )
+
+    save_news_history(history)
+
+    # ── Формирование сообщения ──
     cat_names = {
         "weather": "🌤️ Погода",
         "lng": "🚢 LNG/Экспорт",
@@ -656,29 +902,70 @@ def score_news(titles):
         "demand": "⚡ Спрос",
         "geopolitics": "🌍 Геополитика",
     }
-    msg = f"Всего заголовков: {len(titles)}\n"
-    msg += f"Скоринг: {total:+d} ({'📈 бычий' if total > 0 else '📉 медвежий' if total < 0 else '➡️ нейтральный'})\n"
-    for cat, score in sorted(category_scores.items(), key=lambda x: abs(x[1]), reverse=True):
-        msg += f"{cat_names.get(cat, cat)}: {score:+d} {'📈' if score > 0 else '📉'}\n"
-        for m in category_msgs[cat]:
-            msg += f"  {m}\n"
 
-    if unscored:
-        msg += f"📄 Без скоринга ({len(unscored)}):\n"
-        for t in unscored[:3]:
+    total_in_history = len(history) - (1 if "__meta__" in history else 0)
+
+    msg = f"В истории: {total_in_history} новостей (окно {NEWS_MAX_AGE_HOURS}ч)\n"
+    msg += f"Новых за прогон: {new_count}\n"
+    msg += f"Composite: {composite_int:+d} ("
+    msg += f"{'📈 бычий' if composite_int > 0 else '📉 медвежий' if composite_int < 0 else '➡️ нейтральный'})\n"
+
+    if abs(weighted_total) > 0.1:
+        msg += f"  Взвешенный: {weighted_total:+.2f}\n"
+    if abs(momentum) > 0.1:
+        arrow = "⬆️" if momentum > 0 else "⬇️"
+        msg += f"  Моментум: {momentum:+.2f} {arrow}\n"
+    if burst != 0:
+        msg += f"  {burst_msg}\n"
+    if multi_cat_bonus != 0:
+        msg += f"  {multi_cat_msg}\n"
+
+    msg += "\n"
+    for cat, score in sorted(category_scores.items(), key=lambda x: abs(x[1]), reverse=True):
+        cat_label = cat_names.get(cat, cat)
+        count = category_item_counts.get(cat, 0)
+        arrow = "📈" if score > 0 else "📉" if score < 0 else "➡️"
+        msg += f"{cat_label}: {score:+.2f} {arrow} ({count} заголовков)\n"
+        for t_line in category_titles.get(cat, []):
+            msg += f"{t_line}\n"
+
+    unscored_new = []
+    for title in titles:
+        h = _news_hash(title)
+        entry = history.get(h)
+        if entry and (entry.get("score") is None or entry.get("score") == 0):
+            unscored_new.append(title)
+
+    if unscored_new:
+        msg += f"📄 Без скоринга ({len(unscored_new)} новых):\n"
+        for t in unscored_new[:3]:
             msg += f"  • {t[:80]}\n"
 
     stats = {
-        "total": len(titles),
-        "scored": len(scored_titles),
-        "unscored": len(unscored),
-        "unscored_sample": unscored[:5],
+        "total": total_in_history,
+        "new": new_count,
+        "scored": scored_count,
+        "unscored": len(unscored_new),
+        "composite": composite_int,
+        "weighted": round(weighted_total, 2),
+        "momentum": round(momentum, 2),
+        "burst": burst,
+        "multi_cat": multi_cat_bonus,
     }
 
-    return total, msg, stats
+    return composite_int, msg, stats
+
+
+def _safe_parse_dt(dt_str):
+    """Безопасный парсинг ISO datetime из JSON."""
+    try:
+        return datetime.fromisoformat(dt_str)
+    except Exception:
+        return None
+
 
 # ============================================================
-# МОДУЛЬ 7: POWERBURN (через EIA API + fallback)
+# МОДУЛЬ 7: POWERBURN
 # ============================================================
 
 def fetch_powerburn():
@@ -719,22 +1006,16 @@ def fetch_powerburn():
 
                     ng_pct = (ng_gen / total_gen * 100) if total_gen > 0 else 0
                     coal_pct = (coal_gen / total_gen * 100) if total_gen > 0 else 0
-
                     daily_bcf = (ng_gen * 7.5 / 1_000_000) * 24 if ng_gen > 0 else 0
 
                     logging.info(
                         f"[Powerburn] EIA API: газ={ng_pct:.1f}%, уголь={coal_pct:.1f}%, "
                         f"powerburn≈{daily_bcf:.1f} BCF/d (период: {latest_period})"
                     )
-
                     return {
-                        "realtime_bcf": daily_bcf,
-                        "vs_yesterday": 0,
-                        "daily_bcf": daily_bcf,
-                        "vs_yoy": 0,
-                        "ng_pct": ng_pct,
-                        "ng_yoy": 0,
-                        "coal_pct": coal_pct,
+                        "realtime_bcf": daily_bcf, "vs_yesterday": 0,
+                        "daily_bcf": daily_bcf, "vs_yoy": 0,
+                        "ng_pct": ng_pct, "ng_yoy": 0, "coal_pct": coal_pct,
                     }
             else:
                 logging.warning(f"[Powerburn] EIA API HTTP {r.status_code}")
@@ -764,15 +1045,11 @@ def fetch_powerburn():
     except Exception as e:
         logging.error(f"[Powerburn] CelsiusEnergy error: {e}")
 
-    logging.warning("[Powerburn] Все источники недоступны — fallback значения")
+    logging.warning("[Powerburn] Все источники недоступны — fallback")
     return {
-        "realtime_bcf": 28.0,
-        "vs_yesterday": 0,
-        "daily_bcf": 28.0,
-        "vs_yoy": 0,
-        "ng_pct": 42.0,
-        "ng_yoy": 0,
-        "coal_pct": 15.0,
+        "realtime_bcf": 28.0, "vs_yesterday": 0,
+        "daily_bcf": 28.0, "vs_yoy": 0,
+        "ng_pct": 42.0, "ng_yoy": 0, "coal_pct": 15.0,
     }
 
 def score_powerburn(pb):
@@ -805,67 +1082,108 @@ def score_powerburn(pb):
     return max(-3, min(3, score)), msg
 
 # ============================================================
-# МОДУЛЬ 8: СКОРИНГ И СИГНАЛ
+# МОДУЛЬ 8: СКОРИНГ И СИГНАЛ (v3)
 # ============================================================
 
 def calculate_score(ind, level_score, storage_score, season_score,
                     news_score, pb_score, ml_score=0):
     score = 0
     price, rsi, ma200 = ind["price"], ind["rsi"], ind["ma200"]
+    adx = ind.get("adx", 25.0)
 
-    if rsi > 70: score -= 2
-    elif rsi < 30: score += 2
-    elif rsi > 60: score -= 1
-    elif rsi < 40: score += 1
+    is_trend = adx >= ADX_TREND_THRESHOLD
+    is_range = adx < ADX_RANGE_THRESHOLD
+    above_ma200 = (not np.isnan(ma200)) and (price > ma200)
+    below_ma200 = (not np.isnan(ma200)) and (price < ma200)
 
-    if np.isnan(ma200):
-        pass
-    elif price < ma200: score -= 1
-    elif price > ma200: score += 1
+    # ── RSI с разрешением конфликта vs MA200 ──
+    if rsi > 70:
+        if not (above_ma200 and is_trend):
+            score -= 2  # Перекупленность вне сильного uptrend → штраф
+    elif rsi < 30:
+        if not (below_ma200 and is_trend):
+            score += 2  # Перепроданность вне сильного downtrend → бонус
+    elif rsi > 60:
+        if not (above_ma200 and is_trend):
+            score -= 1
+    elif rsi < 40:
+        if not (below_ma200 and is_trend):
+            score += 1
 
-    if abs(price - ind["bb_upper"]) < 0.02 * price: score -= 1
-    if abs(price - ind["bb_lower"]) < 0.02 * price: score += 1
+    # ── MA200 — трендовый фильтр ──
+    if not np.isnan(ma200):
+        if price > ma200: score += 1
+        elif price < ma200: score -= 1
 
+    # ── Bollinger Bands — контекстные ──
+    if is_range:
+        # Боковик: BB = контртренд
+        if abs(price - ind["bb_upper"]) < 0.02 * price: score -= 1
+        if abs(price - ind["bb_lower"]) < 0.02 * price: score += 1
+    else:
+        # Тренд: BB касание по трегу = нейтрально, против = разворот
+        if abs(price - ind["bb_upper"]) < 0.02 * price:
+            if not above_ma200: score -= 1  # Перекуплен против тренда
+        if abs(price - ind["bb_lower"]) < 0.02 * price:
+            if not below_ma200: score += 1  # Перепродан против тренда
+
+    # ── MACD ──
     if ind["macd_hist"] < 0: score -= 1
     elif ind["macd_hist"] > 0: score += 1
 
-    score += season_score + storage_score + level_score + news_score + pb_score
-    score += ml_score
+    # ── Сезонность: ±1 (статистическая склонность) ──
+    if season_score > 0: score += 1
+    elif season_score < 0: score -= 1
+
+    # ── Фундамент ──
+    score += storage_score + level_score + news_score + pb_score + ml_score
 
     return max(-15, min(15, score))
 
 
 def determine_signal(score, ml_available, news_score, price,
-                     support=None, resistance=None):
-    if not ml_available:
-        return "⬜ ВНЕ ПОЗИЦИИ (нет ML — не торгуем)"
+                     support=None, resistance=None, news_headlines_count=0):
+    """
+    Новая карта порогов с расширенной нейтральной зоной:
+      ≥ +6: 🟢 СИЛЬНЫЙ ЛОНГ
+      +4..+5: 🟡 ЛОНГ
+      +2..+3: ⚪ СЛАБЫЙ ЛОНГ
+      -1..+1: ⬜ ВНЕ ПОЗИЦИИ
+      -2..-3: 🔵 СЛАБЫЙ ШОРТ
+      -4..-5: 🟠 ШОРТ
+      ≤ -6: 🔴 СИЛЬНЫЙ ШОРТ
+    """
+    # ML — не блокирующий, а ограничивающий
+    if not ml_available and abs(score) < 4:
+        return "⬜ ВНЕ ПОЗИЦИИ (нет ML — торгуем только при |score| ≥ 4)"
 
+    # News score=0: различаем «нет заголовков» vs «нейтральные»
     if news_score == 0:
-        if score >= 4:
-            score = 2
-        elif score <= -4:
-            score = -2
+        if news_headlines_count > 0:
+            # Заголовки есть, но все нейтральные — ограничиваем силу сигнала
+            score = max(-3, min(3, score))
+        # Если заголовков 0 (фиоды упали) — не ограничиваем, доверяем технике
 
-    if support and ((price - support) / support) < 0.005:
+    # Защита от входа вплотную к уровням
+    if support and price > 0 and ((price - support) / support) < 0.005:
         return "⬜ ВНЕ ПОЗИЦИИ (цена вплотную к поддержке — риск ложного пробоя)"
-    if resistance and ((resistance - price) / price) < 0.005:
+    if resistance and price > 0 and ((resistance - price) / price) < 0.005:
         return "⬜ ВНЕ ПОЗИЦИИ (цена вплотную к сопротивлению — риск выноса)"
 
-    if score >= 4:
+    if score >= 6:
         return "🟢 СИЛЬНЫЙ ЛОНГ"
-    elif score >= 2:
+    elif score >= 4:
         return "🟡 ЛОНГ"
-    elif score >= 1:
+    elif score >= 2:
         return "⚪ СЛАБЫЙ ЛОНГ"
-    elif score <= -4:
+    elif score <= -6:
         return "🔴 СИЛЬНЫЙ ШОРТ"
-    elif score <= -2:
+    elif score <= -4:
         return "🟠 ШОРТ"
-    elif score <= -1:
+    elif score <= -2:
         return "🔵 СЛАБЫЙ ШОРТ"
     else:
         return "⬜ ВНЕ ПОЗИЦИИ"
-
 
 # ============================================================
 # МОДУЛЬ 9: TELEGRAM
@@ -959,11 +1277,14 @@ def main():
         ind["price"], vp, support_lvls, resistance_lvls, pivots)
 
     storage_bcf, build, forecast = get_eia_storage()
-    storage_score, storage_msg = score_storage(storage_bcf, build, forecast)
+    storage_score, storage_msg = score_storage(storage_bcf, build, forecast, month=now.month)
 
     season_score = seasonality_score(now.month)
+
+    # ── Новости v2 ──
     news_titles = parse_news()
-    news_score, news_msg, news_stats = score_news(news_titles)
+    news_history = load_news_history()
+    news_score, news_msg, news_stats = score_news_v2(news_titles, news_history)
 
     pb_data = fetch_powerburn()
     pb_score, pb_msg = score_powerburn(pb_data)
@@ -989,6 +1310,7 @@ def main():
         price=ind["price"],
         support=nearest_sup,
         resistance=nearest_res,
+        news_headlines_count=len(news_titles),
     )
 
     price, atr = ind["price"], ind["atr"]
@@ -996,14 +1318,15 @@ def main():
     is_long = "ЛОНГ" in signal
     is_short = "ШОРТ" in signal
 
+    # SL/TP: TP1=3×ATR (R/R=2:1), TP2=5×ATR
     if is_long:
-        sl, tp1, tp2 = price - 1.5 * atr, price + 2 * atr, price + 4 * atr
+        sl, tp1, tp2 = price - 1.5 * atr, price + 3 * atr, price + 5 * atr
         if nearest_sup and sl > nearest_sup: sl = nearest_sup - 0.02
     elif is_short:
-        sl, tp1, tp2 = price + 1.5 * atr, price - 2 * atr, price - 4 * atr
+        sl, tp1, tp2 = price + 1.5 * atr, price - 3 * atr, price - 5 * atr
         if nearest_res and sl < nearest_res: sl = nearest_res + 0.02
     else:
-        sl, tp1, tp2 = price - 1.5 * atr, price + 2 * atr, price + 4 * atr
+        sl, tp1, tp2 = price - 1.5 * atr, price + 3 * atr, price + 5 * atr
 
     risk = abs(price - sl)
     rr1 = abs(tp1 - price) / risk if risk > 0 else 0
@@ -1013,7 +1336,17 @@ def main():
     should_send, send_reason = should_send_signal(
         signal, total_score, price, prev_signal, prev_score, prev_timestamp, is_cme)
 
+    # Режим рынка для лога
+    adx = ind.get("adx", 25)
+    if adx >= ADX_TREND_THRESHOLD:
+        market_mode = "ТРЕНД"
+    elif adx < ADX_RANGE_THRESHOLD:
+        market_mode = "Боковик"
+    else:
+        market_mode = "Переходный"
+
     log_line = (f"{signal} | score={total_score} | price=${price:.3f} | "
+                f"ADX={adx:.0f} ({market_mode}) | "
                 f"prev={prev_signal} score={prev_score} | "
                 f"send={should_send} ({send_reason})")
     logging.info(log_line)
@@ -1044,18 +1377,19 @@ def main():
 
     msg += "━━━━ ИНДИКАТОРЫ ━━━━\n"
     msg += f"RSI: {ind['rsi']:.1f} | MA50: ${ind['ma50']:.3f} | MA200: ${ind['ma200']:.3f}\n"
+    msg += f"ADX: {adx:.0f} ({market_mode})\n"
     msg += f"ATR: ${ind['atr']:.3f}\n"
     msg += "━━━━ ЗАПАСЫ EIA ━━━━\n" + storage_msg
     msg += "━━━━ УРОВНИ ━━━━\n" + level_msg
     msg += "━━━━ POWERBURN ━━━━\n" + pb_msg
 
-    # ── Блок новостей с количеством и заголовками ──
-    msg += "━━━━ НОВОСТИ ━━━━\n"
+    # ── Блок новостей v2 ──
+    msg += "━━━━ НОВОСТИ (v2) ━━━━\n"
     if news_stats['total'] == 0:
-        msg += "📰 Новостей за последние 24 часа не найдено.\n"
+        msg += "📰 Новостей в истории нет.\n"
         msg += "(Проверьте доступность RSS-фидов или попробуйте позже)\n"
     else:
-        msg += f"📰 Всего: {news_stats['total']} | Скоринг: {news_stats['scored']} | Без скоринга: {news_stats['unscored']}\n"
+        msg += f"📰 В истории: {news_stats['total']} | Новых: {news_stats['new']} | Скоринг: {news_stats['scored']}\n"
         msg += news_msg
 
     msg += "━━━━ ML-ПРОГНОЗ ━━━━\n" + ml_msg + "\n"
