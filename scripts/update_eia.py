@@ -2,6 +2,12 @@
 
 Запускается из GitHub Actions (американский IP, EIA доступен).
 Локально из РФ — 403, поэтому только через Actions.
+
+Патч от 2026-09-18:
+- facets[series][]=NW2_EPG0_SWO_R48_BCF (Total Working Gas, US);
+- start_date = 730 дней;
+- debug-логирование сырого ответа EIA;
+- fallback на v1 API (старый endpoint).
 """
 
 import json
@@ -19,7 +25,6 @@ from urllib3.util.retry import Retry
 EIA_API_KEY = os.environ.get("EIA_API_KEY", "")
 CACHE_PATH = Path("data/eia_cache.json")
 
-# Fallback-значения, если EIA недоступен
 STORAGE_SEASONAL_NORM = {
     1: 2700, 2: 2300, 3: 1900, 4: 1700, 5: 1900, 6: 2200,
     7: 2500, 8: 2800, 9: 3100, 10: 3400, 11: 3600, 12: 3300,
@@ -46,21 +51,92 @@ def _eia_get(url: str, timeout: int = 20):
     return s.send(prepared, timeout=timeout)
 
 
+def _compute_storage_result(records: list, latest_period: str) -> dict:
+    """Из записей EIA делает итоговый dict."""
+    us_records = []
+    for rec in records:
+        area = str(rec.get("area", "")) + str(rec.get("area-name", "")) + \
+               str(rec.get("duoarea", "")) + str(rec.get("region", ""))
+        if "US" in area or "U.S." in area or "United States" in area or "NUS" in area:
+            us_records.append(rec)
+
+    if not us_records and records:
+        us_records = [max(records, key=lambda x: float(x.get("value", 0) or 0))]
+
+    if len(us_records) >= 2:
+        us_records.sort(key=lambda x: x.get("period", ""), reverse=True)
+        current = float(us_records[0]["value"])
+        prev = float(us_records[1]["value"])
+        build = current - prev
+        period = us_records[0].get("period", "")
+        month = datetime.now().month
+        norm = STORAGE_SEASONAL_NORM.get(month, 3000)
+        deviation_pct = ((current - norm) / norm * 100) if norm > 0 else 0
+
+        print(f"[EIA Storage] OK: {current:.0f} Bcf, закачка {build:+.0f} Bcf, "
+              f"период {period}, отклонение {deviation_pct:+.1f}%")
+
+        return {
+            "status": "ok",
+            "storage": current,
+            "change": build,
+            "five_year_avg": norm,
+            "deviation_pct": deviation_pct,
+            "latest_period": period,
+            "source": "eia_api",
+        }
+    elif len(us_records) == 1:
+        current = float(us_records[0]["value"])
+        period = us_records[0].get("period", "")
+        month = datetime.now().month
+        norm = STORAGE_SEASONAL_NORM.get(month, 3000)
+        deviation_pct = ((current - norm) / norm * 100) if norm > 0 else 0
+
+        print(f"[EIA Storage] Только 1 запись: {current:.0f} Bcf ({period})")
+
+        return {
+            "status": "ok",
+            "storage": current,
+            "change": 0,
+            "five_year_avg": norm,
+            "deviation_pct": deviation_pct,
+            "latest_period": period,
+            "source": "eia_api_partial",
+        }
+
+    return None
+
+
 def fetch_storage(api_key: str) -> dict:
-    """Запасы газа (weekly)."""
-    base_url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
-    start_date = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+    """Запасы газа (weekly). Пробует несколько endpoints и фильтров."""
+
+    # ── Попытка 1: EIA v2 с series NW2 (правильная серия) ──
+    base_url_v2 = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
+    start_date = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
 
     attempts = [
-        {"facets": "facets[series][]=NW2_EPG0_SWO_R48_BCF", "label": "series=NW2"},
-        {"facets": "facets[duoarea][]=NUS&facets[process][]=SAV", "label": "NUS+SAV"},
-        {"facets": "facets[process][]=SAV", "label": "process=SAV"},
+        {
+            "facets": "facets[series][]=NW2_EPG0_SWO_R48_BCF",
+            "label": "v2 series=NW2_EPG0_SWO_R48_BCF",
+        },
+        {
+            "facets": "facets[duoarea][]=NUS&facets[process][]=SAV",
+            "label": "v2 NUS+SAV",
+        },
+        {
+            "facets": "facets[process][]=SAV",
+            "label": "v2 process=SAV",
+        },
+        {
+            "facets": "",
+            "label": "v2 no facets",
+        },
     ]
 
     for attempt in attempts:
         try:
             url = (
-                f"{base_url}"
+                f"{base_url_v2}"
                 f"?api_key={api_key}"
                 f"&frequency=weekly"
                 f"&data[0]=value"
@@ -71,57 +147,81 @@ def fetch_storage(api_key: str) -> dict:
             url += (
                 f"&sort[0][column]=period"
                 f"&sort[0][direction]=desc"
-                f"&length=50"
+                f"&length=20"
             )
 
-            print(f"[EIA Storage] Попытка: {attempt['label']}")
+            print(f"[EIA Storage v2] Попытка: {attempt['label']}")
             r = _eia_get(url, timeout=20)
-            print(f"[EIA Storage] HTTP {r.status_code}")
+            print(f"[EIA Storage v2] HTTP {r.status_code}")
 
             if r.status_code != 200:
-                print(f"[EIA Storage] Ответ: {r.text[:200]}")
+                print(f"[EIA Storage v2] Ответ: {r.text[:300]}")
                 continue
 
-            records = r.json().get("response", {}).get("data", [])
+            body = r.json()
+            response = body.get("response", {})
+            records = response.get("data", [])
+
+            print(f"[EIA Storage v2] Записей: {len(records)}")
+
             if not records:
-                print(f"[EIA Storage] Пустой ответ")
+                # Debug: показываем структуру ответа
+                print(f"[EIA Storage v2] RAW (первые 500): "
+                      f"{json.dumps(body, ensure_ascii=False)[:500]}")
                 continue
 
-            us_records = []
-            for rec in records:
-                area = str(rec.get("area", "")) + str(rec.get("area-name", "")) + \
-                       str(rec.get("duoarea", "")) + str(rec.get("region", ""))
-                if "US" in area or "U.S." in area or "United States" in area or "NUS" in area:
-                    us_records.append(rec)
+            result = _compute_storage_result(records, "")
+            if result:
+                return result
 
-            if not us_records and records:
-                us_records = [max(records, key=lambda x: float(x.get("value", 0) or 0))]
-
-            if len(us_records) >= 2:
-                us_records.sort(key=lambda x: x.get("period", ""), reverse=True)
-                current = float(us_records[0]["value"])
-                prev = float(us_records[1]["value"])
-                build = current - prev
-                period = us_records[0].get("period", "")
-                month = datetime.now().month
-                norm = STORAGE_SEASONAL_NORM.get(month, 3000)
-                deviation_pct = ((current - norm) / norm * 100) if norm > 0 else 0
-
-                print(f"[EIA Storage] OK: {current:.0f} Bcf, закачка {build:+.0f} Bcf, "
-                      f"период {period}, отклонение {deviation_pct:+.1f}%")
-
-                return {
-                    "status": "ok",
-                    "storage": current,
-                    "change": build,
-                    "five_year_avg": norm,
-                    "deviation_pct": deviation_pct,
-                    "latest_period": period,
-                    "source": "eia_api",
-                }
         except Exception as e:
-            print(f"[EIA Storage] Exception: {e}")
+            print(f"[EIA Storage v2] Exception: {e}")
             continue
+
+    # ── Попытка 2: EIA v1 (старый endpoint, часто надёжнее) ──
+    try:
+        print("[EIA Storage v1] Fallback на старый API...")
+        v1_url = (
+            f"https://api.eia.gov/series/"
+            f"?api_key={api_key}"
+            f"&series_id=NW2_EPG0_SWO_R48_BCF"
+        )
+        r = _eia_get(v1_url, timeout=20)
+        print(f"[EIA Storage v1] HTTP {r.status_code}")
+
+        if r.status_code == 200:
+            body = r.json()
+            series = body.get("series", [])
+            if series:
+                data_points = series[0].get("data", [])
+                print(f"[EIA Storage v1] Точек данных: {len(data_points)}")
+
+                if len(data_points) >= 2:
+                    data_points_sorted = sorted(data_points, key=lambda x: x[0], reverse=True)
+                    latest_period, latest_val = data_points_sorted[0]
+                    prev_period, prev_val = data_points_sorted[1]
+                    current = float(latest_val)
+                    prev = float(prev_val)
+                    build = current - prev
+
+                    month = datetime.now().month
+                    norm = STORAGE_SEASONAL_NORM.get(month, 3000)
+                    deviation_pct = ((current - norm) / norm * 100) if norm > 0 else 0
+
+                    print(f"[EIA Storage v1] OK: {current:.0f} Bcf, "
+                          f"закачка {build:+.0f} Bcf, период {latest_period}")
+
+                    return {
+                        "status": "ok",
+                        "storage": current,
+                        "change": build,
+                        "five_year_avg": norm,
+                        "deviation_pct": deviation_pct,
+                        "latest_period": latest_period,
+                        "source": "eia_v1_api",
+                    }
+    except Exception as e:
+        print(f"[EIA Storage v1] Exception: {e}")
 
     print("[EIA Storage] ВСЕ попытки неудачны")
     return {
