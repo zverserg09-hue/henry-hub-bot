@@ -1,0 +1,44 @@
+name: Update EIA Cache
+
+on:
+  schedule:
+    # Каждый день в 13:00 UTC (16:00 МСК) — после отчётов
+    - cron: '0 13 * * *'
+  workflow_dispatch:  # кнопка "Run workflow" для ручного запуска
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # нужно для коммита обратно
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests urllib3
+
+      - name: Update EIA cache
+        env:
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+        run: |
+          python scripts/update_eia.py
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/eia_cache.json
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update EIA cache [skip ci]"
+            git push
+          fi
