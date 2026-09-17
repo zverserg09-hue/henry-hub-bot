@@ -52,10 +52,9 @@ def fetch_storage(api_key: str) -> dict:
     start_date = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
 
     attempts = [
+        {"facets": "facets[series][]=NW2_EPG0_SWO_R48_BCF", "label": "series=NW2"},
         {"facets": "facets[duoarea][]=NUS&facets[process][]=SAV", "label": "NUS+SAV"},
         {"facets": "facets[process][]=SAV", "label": "process=SAV"},
-        {"facets": "facets[duoarea][]=NUS", "label": "duoarea=NUS"},
-        {"facets": "", "label": "no facets"},
     ]
 
     for attempt in attempts:
