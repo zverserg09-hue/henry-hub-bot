@@ -1,0 +1,20 @@
+{
+  "ts": 0,
+  "updated_at": "",
+  "storage": {
+    "status": "not_initialized",
+    "storage": 0,
+    "change": 0,
+    "five_year_avg": 0,
+    "deviation_pct": 0,
+    "latest_period": "",
+    "source": "placeholder"
+  },
+  "powerburn": {
+    "status": "not_initialized",
+    "daily_bcf": 0,
+    "ng_pct": 0,
+    "coal_pct": 0,
+    "source": "placeholder"
+  }
+}
