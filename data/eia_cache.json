@@ -1,14 +1,14 @@
 {
-  "ts": 1789678453.0919778,
-  "updated_at": "2026-09-17T20:54:13.091980+00:00",
+  "ts": 1789679138.6766212,
+  "updated_at": "2026-09-17T21:05:38.676624+00:00",
   "storage": {
-    "status": "error",
-    "storage": 0,
+    "status": "ok",
+    "storage": 3298.0,
     "change": 0,
-    "five_year_avg": 0,
-    "deviation_pct": 0,
-    "latest_period": "",
-    "source": "error"
+    "five_year_avg": 3100,
+    "deviation_pct": 6.387096774193549,
+    "latest_period": "2026-09-11",
+    "source": "eia_api_partial"
   },
   "powerburn": {
     "status": "ok",
