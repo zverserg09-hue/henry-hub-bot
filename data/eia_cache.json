@@ -1,20 +1,21 @@
 {
-  "ts": 0,
-  "updated_at": "",
+  "ts": 1789678453.0919778,
+  "updated_at": "2026-09-17T20:54:13.091980+00:00",
   "storage": {
-    "status": "not_initialized",
+    "status": "error",
     "storage": 0,
     "change": 0,
     "five_year_avg": 0,
     "deviation_pct": 0,
     "latest_period": "",
-    "source": "placeholder"
+    "source": "error"
   },
   "powerburn": {
-    "status": "not_initialized",
-    "daily_bcf": 0,
-    "ng_pct": 0,
-    "coal_pct": 0,
-    "source": "placeholder"
+    "status": "ok",
+    "daily_bcf": 9.60012,
+    "ng_pct": 40.18444429375466,
+    "coal_pct": 9.00070070748853,
+    "latest_period": "2026-09-17T06",
+    "source": "eia_api"
   }
 }
