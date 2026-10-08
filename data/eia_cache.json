@@ -1,21 +1,21 @@
 {
-  "ts": 1791400319.8553855,
-  "updated_at": "2026-10-07T19:11:59.855390+00:00",
+  "ts": 1791486365.172828,
+  "updated_at": "2026-10-08T19:06:05.172831+00:00",
   "storage": {
     "status": "ok",
-    "storage": 3415.0,
-    "change": 64.0,
+    "storage": 3500.0,
+    "change": 85.0,
     "five_year_avg": 3400.0,
-    "deviation_pct": 0.4411764705882353,
-    "latest_period": "2026-09-25",
+    "deviation_pct": 2.941176470588235,
+    "latest_period": "2026-10-02",
     "source": "eia_api"
   },
   "powerburn": {
     "status": "ok",
-    "daily_bcf": 14.544719999999998,
-    "ng_pct": 54.85265866092824,
-    "coal_pct": 6.3315027391029854,
-    "latest_period": "2026-10-07T06",
+    "daily_bcf": 13.69188,
+    "ng_pct": 52.393186530103385,
+    "coal_pct": 6.692243582237589,
+    "latest_period": "2026-10-08T06",
     "source": "eia_api"
   }
 }
