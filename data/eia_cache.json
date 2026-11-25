@@ -1,21 +1,21 @@
 {
-  "ts": 1795560713.1776597,
-  "updated_at": "2026-11-24T22:51:53.177663+00:00",
+  "ts": 1795644629.7747955,
+  "updated_at": "2026-11-25T22:10:29.774799+00:00",
   "storage": {
-    "status": "ok",
-    "storage": 3882.0,
-    "change": 20.0,
-    "five_year_avg": 3600.0,
-    "deviation_pct": 7.833333333333334,
-    "latest_period": "2026-11-13",
-    "source": "eia_api"
+    "status": "error",
+    "storage": 0,
+    "change": 0,
+    "five_year_avg": 0,
+    "deviation_pct": 0,
+    "latest_period": "",
+    "source": "error"
   },
   "powerburn": {
     "status": "ok",
-    "daily_bcf": 7.794179999999999,
-    "ng_pct": 48.15931132663048,
-    "coal_pct": 3.0151703888246284,
-    "latest_period": "2026-11-24T07",
+    "daily_bcf": 7.632,
+    "ng_pct": 48.31138052048676,
+    "coal_pct": 3.7931270224693496,
+    "latest_period": "2026-11-25T07",
     "source": "eia_api"
   }
 }
